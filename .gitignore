@@ -1,0 +1,22 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Model weights & ONNX binaries (downloaded via scripts/setup_model.py)
+model_onnx/
+*.onnx
+*.onnx_data
+*.safetensors
+*.bin
+
+# Environment & IDE
+.env
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Local test payloads
+request.json
+req.json

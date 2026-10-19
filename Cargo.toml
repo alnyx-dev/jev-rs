@@ -1,0 +1,26 @@
+[package]
+name = "jev-rs"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance local System One decision engine, wire-compatible with TypeSafe AI Jev protocol."
+license = "MIT"
+readme = "README.md"
+keywords = ["ai", "decision-model", "typesafe", "onnx", "system-one"]
+categories = ["science", "web-programming::http-server"]
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokenizers = "0.20"
+ort = { version = "2.0.0-rc.15", features = ["download-binaries", "tls-rustls", "ndarray", "directml"] }
+ndarray = "0.17"
+uuid = { version = "1.0", features = ["v4"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
