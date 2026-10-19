@@ -68,6 +68,33 @@ Open **http://127.0.0.1:8000/** — a built-in telemetry page with real-time req
 | `GET /history` | Last 50 requests (backfills the dashboard on page load) |
 | `GET /health`, `GET /ready` | Liveness probes |
 
+## ⚙️ Configuration & limits
+
+Everything works with defaults; all knobs are environment variables:
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `HOST` / `PORT` | `127.0.0.1` / `8000` | Bind address. Binding a non-loopback host prints a security warning (`JEV_ALLOW_REMOTE=1` acknowledges it). |
+| `JEV_MODEL_PATH` | `model_onnx/model.onnx` | ONNX model file. |
+| `JEV_TOKENIZER_PATH` | `model_onnx/tokenizer.json` | Tokenizer file. |
+| `JEV_TEMPERATURE` | `1.65` | RLCD calibration temperature; must be finite with `0 < t <= 10`, otherwise the server refuses to start. |
+| `JEV_MAX_BODY_BYTES` | `131072` (128 KiB) | Request-body limit (`413` on exceed). |
+| `JEV_MAX_CONCURRENCY` | `2` | Max concurrent forward passes (`503` when exhausted). |
+| `JEV_TIMEOUT` | `30` (seconds) | Per-request inference timeout (`504`). |
+
+Error status codes:
+
+| Code | Meaning |
+| :--- | :--- |
+| `400` | Malformed `questions` (unknown type, missing/empty/non-string `criteria`) |
+| `413` | Request body over the size limit |
+| `503` | Too many concurrent inferences |
+| `504` | Inference timed out (`JEV_TIMEOUT`) |
+
+> ℹ️ **Platforms:** DirectML GPU acceleration is Windows-only. Build with
+> `cargo build --release --no-default-features` on Linux / macOS for CPU
+> inference (the feature-gated `dml` flag routes to plain ONNX Runtime EPs).
+
 ---
 
 ## 📡 API Usage
