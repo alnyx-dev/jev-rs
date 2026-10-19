@@ -10,14 +10,20 @@ categories = ["science", "web-programming::http-server"]
 
 [dependencies]
 axum = "0.7"
-tokio = { version = "1.0", features = ["full"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokenizers = "0.20"
 tokio-stream = { version = "0.1", features = ["sync"] }
-ort = { version = "2.0.0-rc.15", features = ["download-binaries", "tls-rustls", "ndarray", "directml"] }
+ort = { version = "2.0.0-rc.15", features = ["download-binaries", "tls-rustls", "ndarray"] }
 ndarray = "0.17"
 uuid = { version = "1.0", features = ["v4"] }
+
+[features]
+default = ["dml"]
+# DirectML (DirectX 12) GPU acceleration — Windows-only. Build with
+# `--no-default-features` on other platforms to use CPU inference.
+dml = ["ort/directml"]
 
 [profile.release]
 opt-level = 3
