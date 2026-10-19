@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text x='1' y='13' font-size='13'>⚡</text></svg>">
 <title>Jev-RS — Live Telemetry</title>
 <style>
   :root {
@@ -329,7 +330,6 @@
     : v >= 1e6 ? (v / 1e6).toFixed(1) + 'M'
     : v >= 1e3 ? (v / 1e3).toFixed(1) + 'k' : String(v);
   const fmtTime = ts => new Date(ts).toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  const esc = s => String(s).replace(/[<>&]/g, '');
   const confColor = p => p >= 0.75 ? 'var(--ok)' : p >= 0.4 ? 'var(--warn)' : 'var(--bad)';
 
   function getLatencyClass(ms) {
@@ -384,45 +384,92 @@
     if (a.type === 'noul') { val = (a.noul * 100).toFixed(1) + '%'; conf = a.noul; }
     else if (a.type === 'choice') { val = a.choice; conf = a.confidence; }
     else { val = String(a.score); conf = a.confidence; }
-    
-    let bar = '';
+
+    const row = document.createElement('div');
+    row.className = 'q';
+
+    const qidEl = document.createElement('span');
+    qidEl.className = 'qid';
+    qidEl.textContent = qid;
+    row.appendChild(qidEl);
+
+    const chipEl = document.createElement('span');
+    chipEl.className = 'chip';
+    chipEl.textContent = chip;
+    row.appendChild(chipEl);
+
+    const valEl = document.createElement('span');
+    valEl.className = 'val';
+    valEl.textContent = val;
+    row.appendChild(valEl);
+
     if (conf !== null) {
       const color = confColor(conf);
-      bar = '<span class="qbar"><i style="width:' + Math.round(conf * 100) + '%;background:' + color + '"></i></span>' +
-            '<span class="conf">' + Math.round(conf * 100) + '%</span>';
+      const bar = document.createElement('span');
+      bar.className = 'qbar';
+      const fill = document.createElement('i');
+      fill.style.width = Math.round(conf * 100) + '%';
+      fill.style.background = color;
+      bar.appendChild(fill);
+      const confEl = document.createElement('span');
+      confEl.className = 'conf';
+      confEl.textContent = Math.round(conf * 100) + '%';
+      row.append(bar, confEl);
     }
-    return '<div class="q">' +
-             '<span class="qid">' + esc(qid) + '</span>' +
-             '<span class="chip">' + esc(chip) + '</span>' +
-             '<span class="val">' + esc(val) + '</span>' +
-             bar +
-           '</div>';
+    return row;
   }
 
   function addEntry(e, prepend) {
     const emptyEl = feed.querySelector('.empty');
     if (emptyEl) emptyEl.remove();
 
-    let body = '';
-    for (const qid in e.answers) body += answerRow(qid, e.answers[qid]);
-    
-    const latCls = getLatencyClass(e.latency_ms);
+    const chev = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    chev.setAttribute('class', 'chevron');
+    chev.setAttribute('viewBox', '0 0 24 24');
+    chev.setAttribute('fill', 'none');
+    chev.setAttribute('stroke', 'currentColor');
+    chev.setAttribute('stroke-width', '2.5');
+    chev.setAttribute('stroke-linecap', 'round');
+    chev.setAttribute('stroke-linejoin', 'round');
+    const poly = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+    poly.setAttribute('points', '9 18 15 12 9 6');
+    chev.appendChild(poly);
+
+    const tsEl = document.createElement('span');
+    tsEl.className = 'ts';
+    tsEl.textContent = fmtTime(e.ts);
+
+    const idEl = document.createElement('span');
+    idEl.className = 'id';
+    idEl.textContent = e.id;
+
+    const extraEl = document.createElement('span');
+    extraEl.className = 'extra';
+    extraEl.textContent = '· ' + e.questions + ' Qs · ' + fmtCount(e.tokens) + ' toks';
+
+    const msEl = document.createElement('span');
+    msEl.className = 'ms ' + getLatencyClass(e.latency_ms);
+    msEl.textContent = fmtMs(e.latency_ms);
+
+    const summary = document.createElement('summary');
+    summary.append(chev, tsEl, idEl, extraEl, msEl);
+
     const d = document.createElement('details');
     d.className = 'req';
-    d.innerHTML =
-      '<summary>' +
-        '<svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>' +
-        '<span class="ts">' + fmtTime(e.ts) + '</span>' +
-        '<span class="id">' + esc(e.id) + '</span>' +
-        '<span class="extra">· ' + e.questions + ' Qs · ' + fmtCount(e.tokens) + ' toks</span>' +
-        '<span class="ms ' + latCls + '">' + fmtMs(e.latency_ms) + '</span>' +
-      '</summary>' +
-      (e.state_preview ? '<div class="state-preview">' + esc(e.state_preview) + '</div>' : '') + 
-      body;
-      
+    d.appendChild(summary);
+
+    if (e.state_preview) {
+      const preview = document.createElement('div');
+      preview.className = 'state-preview';
+      preview.textContent = e.state_preview;
+      d.appendChild(preview);
+    }
+
+    for (const qid in e.answers) d.appendChild(answerRow(qid, e.answers[qid]));
+
     if (prepend && feed.firstChild) feed.insertBefore(d, feed.firstChild);
     else feed.appendChild(d);
-    
+
     while (feed.children.length > MAX_FEED) feed.removeChild(feed.lastChild);
   }
 

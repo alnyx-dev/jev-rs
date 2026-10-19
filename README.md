@@ -31,6 +31,8 @@ Traditional LLMs are slow, non-deterministic, and generate tokens sequentially. 
 | **Jev-RS (CPU)** | 16-thread CPU (AVX-512) | ~850 ms | ~400 MB |
 | **Traditional LLM** | GPU (Token-by-token JSON) | ~1,500 - 3,500 ms | 4 - 8 GB |
 
+> ℹ️ Latency numbers are illustrative back-of-envelope estimates — measure on your own hardware.
+
 ---
 
 ## 📦 Quickstart
