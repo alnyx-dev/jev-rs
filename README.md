@@ -70,6 +70,13 @@ Open **http://127.0.0.1:8000/** — a built-in telemetry page with real-time req
 | `GET /history` | Last 50 requests (backfills the dashboard on page load) |
 | `GET /health`, `GET /ready` | Liveness probes |
 
+## 📦 Releases
+
+Versioned binaries are published automatically: bumping `version` in
+`Cargo.toml` and pushing to `main` creates a `v*` tag and a GitHub Release
+with prebuilt binaries for `windows-x86_64` (DirectML), `linux-x86_64`
+(CPU) and `macos-aarch64` (CPU), each with a SHA-256 checksum.
+
 ## ⚙️ Configuration & limits
 
 Everything works with defaults; all knobs are environment variables:

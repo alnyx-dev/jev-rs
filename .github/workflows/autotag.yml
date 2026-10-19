@@ -1,0 +1,41 @@
+name: Auto-tag
+
+# Creates a v-version tag automatically when the Cargo.toml version changes
+# on main, which triggers release.yml to build and publish a GitHub Release.
+# Manual tags also work: `git tag v0.x.y && git push`.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # need history to check whether the tag already exists
+
+      - name: Read version
+        id: ver
+        run: |
+          VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $VERSION"
+
+      - name: Create tag if missing
+        run: |
+          TAG="v${{ steps.ver.outputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists — nothing to do."
+          else
+            git tag "$TAG" "${{ github.sha }}"
+            git push origin "$TAG"
+            echo "Created and pushed tag $TAG (release pipeline will now build it)."
+          fi
