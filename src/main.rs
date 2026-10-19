@@ -1,9 +1,9 @@
 mod dashboard;
 
 use axum::{
-    extract::{DefaultBodyLimit, State},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, State},
     http::{HeaderMap, HeaderValue, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -28,7 +28,7 @@ const ENTAILMENT_IDX: usize = 0;
 // -----------------------------------------------------------------------------
 // TypeSafe Wire Protocol Data Structures
 // -----------------------------------------------------------------------------
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct QuestionSchema {
     #[serde(rename = "type")]
     q_type: String, // "noul", "choice", "score"
@@ -107,9 +107,71 @@ fn softmax(logits: &[f32], temperature: f32) -> Vec<f32> {
     exps.iter().map(|&x| (x / sum * 10000.0).round() / 10000.0).collect()
 }
 
-/// Uniform 400-response for malformed wire-protocol payloads.
-fn bad_request(msg: impl Into<String>) -> (StatusCode, String) {
-    (StatusCode::BAD_REQUEST, msg.into())
+/// JSON error envelope for consistent, machine-readable API errors:
+/// `{"error": {"code": <status>, "message": "..."}}`.
+#[derive(Debug, Clone)]
+struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn bad_request(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: msg.into(),
+        }
+    }
+
+    fn internal(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: msg.into(),
+        }
+    }
+
+    fn service_unavailable(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: msg.into(),
+        }
+    }
+
+    fn gateway_timeout(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            message: msg.into(),
+        }
+    }
+
+    /// Map an axum extractor rejection (bad JSON body, missing content-type,
+    /// body over the size limit) into the same envelope.
+    fn from_rejection(rejection: JsonRejection) -> Self {
+        Self {
+            status: rejection.status(),
+            message: rejection.body_text(),
+        }
+    }
+}
+
+impl From<ApiError> for (StatusCode, String) {
+    fn from(e: ApiError) -> Self {
+        (e.status, e.message)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let code = self.status.as_u16();
+        let status = self.status;
+        (
+            status,
+            Json(serde_json::json!({
+                "error": { "code": code, "message": self.message }
+            })),
+        )
+            .into_response()
+    }
 }
 
 /// Determine the NLI entailment class index from the exported model's
@@ -178,12 +240,14 @@ fn compute_confidence(probs: &[f32]) -> f32 {
     (conf.clamp(0.0, 1.0) * 10000.0).round() / 10000.0
 }
 
+#[derive(Debug)]
 enum TaskKind {
     Noul,
     Choice { keys: Vec<String> },
     Score { levels: Vec<String> },
 }
 
+#[derive(Debug)]
 struct TaskMeta {
     id: String,
     start: usize,
@@ -191,33 +255,24 @@ struct TaskMeta {
     kind: TaskKind,
 }
 
-// -----------------------------------------------------------------------------
-// Request Handler (Single Forward Pass)
-// -----------------------------------------------------------------------------
-async fn handle_systemone(
-    State(app): State<Arc<AppState>>,
-    Json(payload): Json<SystemOneRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let start_time = Instant::now();
-    let req_id = format!("so_{}", &Uuid::new_v4().to_string().replace("-", "")[..12]);
-
-    let state_text = match &payload.state {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    };
-
+/// Flatten the wire-protocol questions into the evaluation pair list
+/// (premise, hypothesis) and per-question task metadata used to slice the
+/// entailment logits. Rejects malformed questions with a JSON 400 error.
+fn build_tasks(
+    state_text: &str,
+    questions: &BTreeMap<String, QuestionSchema>,
+) -> Result<(Vec<(String, String)>, Vec<TaskMeta>), ApiError> {
     let mut premise_hypo_pairs: Vec<(String, String)> = Vec::new();
     let mut tasks: Vec<TaskMeta> = Vec::new();
 
-    // 1. Flatten all questions into a single batch of hypothesis pairs
-    for (q_id, q) in &payload.questions {
+    for (q_id, q) in questions {
         let instr = q.instructions.as_deref().unwrap_or("");
         let start_idx = premise_hypo_pairs.len();
 
         match q.q_type.to_lowercase().as_str() {
             "noul" => {
-                premise_hypo_pairs.push((state_text.clone(), format!("{}: Yes, true.", instr)));
-                premise_hypo_pairs.push((state_text.clone(), format!("{}: No, false.", instr)));
+                premise_hypo_pairs.push((state_text.to_string(), format!("{}: Yes, true.", instr)));
+                premise_hypo_pairs.push((state_text.to_string(), format!("{}: No, false.", instr)));
                 tasks.push(TaskMeta {
                     id: q_id.clone(),
                     start: start_idx,
@@ -231,38 +286,38 @@ async fn handle_systemone(
                     Some(serde_json::Value::Object(map)) => {
                         for (k, v) in map {
                             let desc = v.as_str().ok_or_else(|| {
-                                bad_request(format!(
+                                ApiError::bad_request(format!(
                                     "question '{}': 'choice' criteria values must be strings",
                                     q_id
                                 ))
                             })?;
                             keys.push(k.clone());
                             premise_hypo_pairs
-                                .push((state_text.clone(), format!("{}: {}", instr, desc)));
+                                .push((state_text.to_string(), format!("{}: {}", instr, desc)));
                         }
                     }
                     Some(serde_json::Value::Array(arr)) => {
                         for v in arr {
                             let desc = v.as_str().ok_or_else(|| {
-                                bad_request(format!(
+                                ApiError::bad_request(format!(
                                     "question '{}': 'choice' criteria array items must be strings",
                                     q_id
                                 ))
                             })?;
                             keys.push(desc.to_string());
                             premise_hypo_pairs
-                                .push((state_text.clone(), format!("{}: {}", instr, desc)));
+                                .push((state_text.to_string(), format!("{}: {}", instr, desc)));
                         }
                     }
                     _ => {
-                        return Err(bad_request(format!(
+                        return Err(ApiError::bad_request(format!(
                             "question '{}': type 'choice' requires a 'criteria' object or array of strings",
                             q_id
                         )));
                     }
                 }
                 if keys.is_empty() {
-                    return Err(bad_request(format!(
+                    return Err(ApiError::bad_request(format!(
                         "question '{}': 'choice' criteria must not be empty",
                         q_id
                     )));
@@ -280,7 +335,7 @@ async fn handle_systemone(
                     Some(serde_json::Value::Array(arr)) => {
                         for v in arr {
                             let lvl = v.as_str().ok_or_else(|| {
-                                bad_request(format!(
+                                ApiError::bad_request(format!(
                                     "question '{}': 'score' criteria array items must be strings",
                                     q_id
                                 ))
@@ -288,7 +343,7 @@ async fn handle_systemone(
                             levels.push(lvl.to_string());
                         }
                         if levels.is_empty() {
-                            return Err(bad_request(format!(
+                            return Err(ApiError::bad_request(format!(
                                 "question '{}': 'score' criteria must not be empty",
                                 q_id
                             )));
@@ -298,14 +353,14 @@ async fn handle_systemone(
                     // with the previous behavior.
                     None => levels = vec!["Low".into(), "Medium".into(), "High".into()],
                     _ => {
-                        return Err(bad_request(format!(
+                        return Err(ApiError::bad_request(format!(
                             "question '{}': type 'score' requires 'criteria' as an array of strings",
                             q_id
                         )));
                     }
                 }
                 for lvl in &levels {
-                    premise_hypo_pairs.push((state_text.clone(), format!("{}: {}", instr, lvl)));
+                    premise_hypo_pairs.push((state_text.to_string(), format!("{}: {}", instr, lvl)));
                 }
                 tasks.push(TaskMeta {
                     id: q_id.clone(),
@@ -315,7 +370,7 @@ async fn handle_systemone(
                 });
             }
             _ => {
-                return Err(bad_request(format!(
+                return Err(ApiError::bad_request(format!(
                     "Unsupported question type: {}",
                     q.q_type
                 )));
@@ -326,10 +381,34 @@ async fn handle_systemone(
     // Guard: an empty questions map (or questions that produced no evaluation
     // pairs) would otherwise panic on `encodings[0]` below.
     if premise_hypo_pairs.is_empty() {
-        return Err(bad_request(
+        return Err(ApiError::bad_request(
             "Request must contain at least one valid question that produces evaluation pairs",
         ));
     }
+
+    Ok((premise_hypo_pairs, tasks))
+}
+
+// -----------------------------------------------------------------------------
+// Request Handler (Single Forward Pass)
+// -----------------------------------------------------------------------------
+async fn handle_systemone(
+    State(app): State<Arc<AppState>>,
+    payload: Result<Json<SystemOneRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Json(payload) = payload.map_err(ApiError::from_rejection)?;
+
+    let start_time = Instant::now();
+    let req_id = format!("so_{}", &Uuid::new_v4().to_string().replace("-", "")[..12]);
+
+    let state_text = match &payload.state {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+
+    // 1. Flatten all questions into a single batch of hypothesis pairs
+    let (mut premise_hypo_pairs, tasks) =
+        build_tasks(&state_text, &payload.questions)?;
 
     // 2. Vectorized batch tokenization. CPU-bound — offloaded to the blocking
     // pool so async worker threads stay responsive for /health, SSE, etc.
@@ -343,12 +422,12 @@ async fn handle_systemone(
         })
         .await
         {
-            Ok(res) => res.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            Ok(res) => res.map_err(|e| ApiError::internal(e.to_string()))?,
             Err(e) => {
-                return Err((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Tokenization task failed: {}", e),
-                ))
+                return Err(ApiError::internal(format!(
+                    "Tokenization task failed: {}",
+                    e
+                )))
             }
         }
     };
@@ -375,9 +454,9 @@ async fn handle_systemone(
     // 3. Tensor creation
     let shape = [batch_size, seq_len];
     let input_ids_tensor = Tensor::from_array((shape, flat_input_ids))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let attention_mask_tensor = Tensor::from_array((shape, flat_attention_mask))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| ApiError::internal(e.to_string()))?;
 
     // 4. Single forward pass (GPU / DirectML). Offloaded to the blocking pool
     // so the async runtime stays responsive; bounded by a concurrency permit
@@ -389,10 +468,7 @@ async fn handle_systemone(
         .clone()
         .try_acquire_owned()
         .map_err(|_| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Server busy: too many concurrent inferences".to_string(),
-            )
+            ApiError::service_unavailable("Server busy: too many concurrent inferences")
         })?;
 
     let entail_idx = app.entailment_idx;
@@ -446,18 +522,18 @@ async fn handle_systemone(
 
     let entail_logits = match run_result {
         Err(_) => {
-            return Err((
-                StatusCode::GATEWAY_TIMEOUT,
-                format!("Inference timed out after {}s", app.inference_timeout),
-            ))
+            return Err(ApiError::gateway_timeout(format!(
+                "Inference timed out after {}s",
+                app.inference_timeout
+            )))
         }
         Ok(Err(join_err)) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Inference task failed: {}", join_err),
-            ))
+            return Err(ApiError::internal(format!(
+                "Inference task failed: {}",
+                join_err
+            )))
         }
-        Ok(Ok(Err(e))) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
+        Ok(Ok(Err(e))) => return Err(ApiError::internal(e)),
         Ok(Ok(Ok(entail))) => entail,
     };
 
@@ -767,6 +843,208 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[+] Server listening on http://{}", bind_addr);
     println!("============================================================");
 
-    axum::serve(listener, app).await?;
+    // Graceful shutdown: Ctrl-C stops accepting new requests and lets the
+    // in-flight handlers finish before returning.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            println!("[i] Ctrl-C received — shutting down gracefully...");
+            let _ = shutdown_tx.send(());
+        }
+    });
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = shutdown_rx.await;
+        })
+        .await?;
+    println!("[i] Shutdown complete.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn question(q_type: &str, instructions: Option<&str>, criteria: Option<serde_json::Value>) -> QuestionSchema {
+        QuestionSchema {
+            q_type: q_type.into(),
+            instructions: instructions.map(Into::into),
+            criteria,
+        }
+    }
+
+    fn questions(entries: &[(&str, QuestionSchema)]) -> BTreeMap<String, QuestionSchema> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    // --- build_tasks: valid shapes ---------------------------------------
+    #[test]
+    fn noul_produces_two_pairs() {
+        let qs = questions(&[("a", question("noul", Some("Urgent?"), None))]);
+        let (pairs, tasks) = build_tasks("S", &qs).unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(tasks.len(), 1);
+        assert!(pairs[0].1.starts_with("Urgent?: Yes, true."));
+    }
+
+    #[test]
+    fn choice_object_uses_key_names() {
+        let qs = questions(&[(
+            "cat",
+            question(
+                "choice",
+                Some("Category"),
+                Some(serde_json::json!({"billing": "Payment issues", "general": "Other"})),
+            ),
+        )]);
+        let (pairs, tasks) = build_tasks("S", &qs).unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert!(matches!(&tasks[0].kind, TaskKind::Choice { keys } if keys == &vec!["billing".to_string(), "general".to_string()]));
+    }
+
+    #[test]
+    fn choice_array_uses_descriptions() {
+        let qs = questions(&[(
+            "cat",
+            question("choice", None, Some(serde_json::json!(["A", "B"]))),
+        )]);
+        let (_, tasks) = build_tasks("S", &qs).unwrap();
+        assert!(matches!(&tasks[0].kind, TaskKind::Choice { keys } if keys == &vec!["A".to_string(), "B".to_string()]));
+    }
+
+    #[test]
+    fn score_without_criteria_uses_default_levels() {
+        let qs = questions(&[("f", question("score", Some("Frustration"), None))]);
+        let (pairs, tasks) = build_tasks("S", &qs).unwrap();
+        assert_eq!(pairs.len(), 3);
+        assert!(matches!(&tasks[0].kind, TaskKind::Score { levels } if levels.len() == 3));
+    }
+
+    // --- build_tasks: rejection of malformed payloads ---------------------
+    #[test]
+    fn choice_without_criteria_is_rejected() {
+        let qs = questions(&[("a", question("choice", Some("pick"), None))]);
+        let err = build_tasks("S", &qs).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("question 'a'"));
+    }
+
+    #[test]
+    fn choice_with_empty_criteria_is_rejected() {
+        let qs = questions(&[("a", question("choice", None, Some(serde_json::json!({}))))]);
+        assert_eq!(build_tasks("S", &qs).unwrap_err().status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn choice_with_non_string_values_is_rejected() {
+        let qs = questions(&[(
+            "a",
+            question("choice", None, Some(serde_json::json!({"x": 5}))),
+        )]);
+        assert!(build_tasks("S", &qs).unwrap_err().message.contains("criteria values must be strings"));
+    }
+
+    #[test]
+    fn score_with_non_string_items_is_rejected() {
+        let qs = questions(&[(
+            "a",
+            question("score", None, Some(serde_json::json!([1, 2, 3]))),
+        )]);
+        assert!(build_tasks("S", &qs).unwrap_err().message.contains("array items must be strings"));
+    }
+
+    #[test]
+    fn unknown_type_is_rejected() {
+        let qs = questions(&[("a", question("weird", None, None))]);
+        assert!(build_tasks("S", &qs).unwrap_err().message.contains("Unsupported question type"));
+    }
+
+    #[test]
+    fn empty_questions_map_is_rejected() {
+        let qs = questions(&[]);
+        assert!(build_tasks("S", &qs).unwrap_err().message.contains("at least one valid question"));
+    }
+
+    // --- calibration math --------------------------------------------------
+    #[test]
+    fn softmax_two_class_known_values() {
+        let probs = softmax(&[1.0, 0.0], 1.0);
+        assert_eq!(probs, vec![0.7311, 0.2689]);
+    }
+
+    #[test]
+    fn softmax_flattens_with_higher_temperature() {
+        let flat = softmax(&[1.0, 0.0], 2.0);
+        assert_eq!(flat, vec![0.6225, 0.3775]);
+        assert!(flat[0] < 0.7311);
+    }
+
+    #[test]
+    fn softmax_preserves_distribution_shape() {
+        let probs = softmax(&[3.0, 1.0, 0.0], 1.0);
+        assert!(probs[0] > probs[1]);
+        assert!(probs[1] > probs[2]);
+        assert!((probs.iter().sum::<f32>() - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn confidence_is_certain_for_single_class() {
+        assert_eq!(compute_confidence(&[1.0]), 1.0);
+    }
+
+    #[test]
+    fn confidence_is_zero_for_uniform_distribution() {
+        assert_eq!(compute_confidence(&[0.5, 0.5]), 0.0);
+        assert_eq!(compute_confidence(&[0.25, 0.25, 0.25, 0.25]), 0.0);
+    }
+
+    #[test]
+    fn confidence_is_high_for_skewed_distribution() {
+        let conf = compute_confidence(&[0.99, 0.01]);
+        assert!(conf > 0.9 && conf < 0.93, "got {}", conf);
+    }
+
+    // --- entailment index resolution --------------------------------------
+    fn temp_dir_with_config(json: Option<&str>) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "jev-rs-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(json) = json {
+            std::fs::write(dir.join("config.json"), json).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn entailment_index_resolved_from_id2label() {
+        let dir = temp_dir_with_config(Some(
+            r#"{"id2label": {"0": "contradiction", "1": "entailment"}}"#,
+        ));
+        let model_path = dir.join("model.onnx").to_string_lossy().to_string();
+        assert_eq!(resolve_entailment_index(&model_path), 1);
+    }
+
+    #[test]
+    fn entailment_index_resolved_from_true_false() {
+        let dir = temp_dir_with_config(Some(r#"{"id2label": {"0": "false", "1": "true"}}"#));
+        let model_path = dir.join("model.onnx").to_string_lossy().to_string();
+        assert_eq!(resolve_entailment_index(&model_path), 1);
+    }
+
+    #[test]
+    fn entailment_index_falls_back_without_config() {
+        let dir = temp_dir_with_config(None);
+        let model_path = dir.join("model.onnx").to_string_lossy().to_string();
+        assert_eq!(resolve_entailment_index(&model_path), ENTAILMENT_IDX);
+    }
 }
