@@ -20,3 +20,7 @@ model_onnx/
 # Local test payloads
 request.json
 req.json
+# Runtime logs
+server.log
+server.err.log
+*.log

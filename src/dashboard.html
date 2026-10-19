@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jev-RS — Live Telemetry</title>
+<style>
+  :root {
+    --bg: #090b10;
+    --panel: #0f141c;
+    --panel-hover: #141b26;
+    --line: rgba(255, 255, 255, 0.07);
+    --line-focus: rgba(56, 189, 248, 0.3);
+    --text: #f1f5f9;
+    --dim: #79879c;
+    --accent: #38bdf8;
+    --ok: #34d399;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+  
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.5 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+    letter-spacing: -0.01em;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 980px; margin: 0 auto; padding: 32px 20px 48px; }
+  
+  /* Header */
+  header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 24px; }
+  h1 { font-size: 19px; font-weight: 600; letter-spacing: -0.02em; display: flex; align-items: center; gap: 8px; }
+  .dim { color: var(--dim); font-weight: 400; }
+  .sub { color: var(--dim); font-size: 12px; margin-top: 4px; }
+  
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.02);
+    border-radius: 999px;
+    padding: 5px 12px;
+    font-size: 11.5px;
+    white-space: nowrap;
+    transition: all .2s ease;
+  }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .badge.on  { color: var(--ok); border-color: rgba(52, 211, 153, 0.25); background: rgba(52, 211, 153, 0.05); }
+  .badge.on .dot { box-shadow: 0 0 8px var(--ok); animation: pulse 2.5s infinite; }
+  .badge.off { color: var(--bad); border-color: rgba(248, 113, 113, 0.25); }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: .4; transform: scale(0.85); }
+  }
+
+  a.badge.gh { text-decoration: none; color: var(--dim); }
+  a.badge.gh:hover {
+    color: var(--text);
+    border-color: rgba(255, 255, 255, 0.2);
+    background: var(--panel-hover);
+  }
+  a.badge.gh svg { flex-shrink: 0; fill: currentColor; }
+
+  /* Metric Tiles */
+  .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 18px; }
+  .tile {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 14px 16px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+    position: relative;
+    overflow: hidden;
+  }
+  .tile::before {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
+  }
+  .tile .k { color: var(--dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+  .tile .v { font-size: 22px; font-weight: 600; margin-top: 6px; font-variant-numeric: tabular-nums; }
+
+  /* Sections */
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 16px 18px;
+    margin-bottom: 18px;
+    box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.3);
+  }
+  .card-title {
+    color: var(--dim);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  /* Micro Bar Chart */
+  .chart-wrap {
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px 12px;
+  }
+  .chart {
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+    height: 64px;
+  }
+  .chart:empty {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+  .chart:empty::after { content: 'waiting for telemetry…'; color: var(--dim); font-size: 11px; }
+  
+  .bar-col {
+    flex: 1;
+    height: 100%;
+    display: flex;
+    align-items: flex-end;
+    background: rgba(255, 255, 255, 0.02);
+    border-radius: 3px;
+    cursor: default;
+    transition: background .15s;
+  }
+  .bar-col:hover { background: rgba(255, 255, 255, 0.08); }
+  .bar {
+    width: 100%;
+    min-height: 4px;
+    border-radius: 2px 2px 0 0;
+    transition: height .25s ease, background .25s ease;
+  }
+
+  /* Scrollable Feed Container & Custom Scrollbar */
+  #feed {
+    max-height: 440px;
+    overflow-y: scroll;
+    padding-right: 6px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+  }
+  #feed::-webkit-scrollbar { width: 5px; }
+  #feed::-webkit-scrollbar-track { background: transparent; }
+  #feed::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.12);
+    border-radius: 4px;
+  }
+  #feed::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.25); }
+  #feed::-webkit-scrollbar-button { display: none; height: 0; width: 0; }
+
+  /* Request Log Items */
+  .req {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    background: rgba(255, 255, 255, 0.012);
+    transition: border-color .15s, background .15s;
+    overflow: hidden;
+  }
+  .req:hover { border-color: rgba(255, 255, 255, 0.15); background: rgba(255, 255, 255, 0.025); }
+  .req[open] { border-color: var(--line-focus); background: rgba(0, 0, 0, 0.2); }
+
+  .req summary {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    padding: 10px 14px;
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+  }
+  .req summary::-webkit-details-marker { display: none; }
+  
+  .chevron {
+    width: 12px;
+    height: 12px;
+    color: var(--dim);
+    transition: transform .2s ease;
+    flex-shrink: 0;
+  }
+  .req[open] .chevron { transform: rotate(90deg); color: var(--accent); }
+
+  .req .ts { color: var(--dim); font-size: 12px; font-variant-numeric: tabular-nums; }
+  .req .id { color: var(--accent); font-weight: 500; }
+  .req .extra { color: var(--dim); font-size: 12px; }
+  
+  .req .ms {
+    margin-left: auto;
+    font-size: 11.5px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--line);
+    padding: 2px 7px;
+    border-radius: 4px;
+  }
+  .ms.fast { color: var(--accent); }
+  .ms.mid  { color: var(--warn); border-color: rgba(251, 191, 36, 0.2); }
+  .ms.slow { color: var(--bad);  border-color: rgba(248, 113, 113, 0.2); }
+  
+  .req .state-preview {
+    padding: 2px 14px 12px 38px;
+    color: var(--dim);
+    font-size: 12px;
+    line-height: 1.4;
+    word-break: break-word;
+    border-bottom: 1px solid var(--line);
+  }
+
+  /* Answer rows */
+  .q {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    padding: 8px 14px 8px 38px;
+    border-top: 1px solid rgba(255, 255, 255, 0.03);
+    font-size: 12.5px;
+  }
+  .q:first-of-type { border-top: none; }
+  .q .qid { width: 140px; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-shrink: 0; }
+  .q .chip {
+    font-size: 10px;
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.02);
+    padding: 1px 7px;
+    border-radius: 4px;
+    color: var(--dim);
+    flex-shrink: 0;
+    text-transform: uppercase;
+  }
+  .q .val { font-weight: 600; min-width: 60px; }
+  .qbar { width: 90px; height: 5px; background: rgba(255, 255, 255, 0.06); border-radius: 3px; overflow: hidden; flex-shrink: 0; margin-left: auto; }
+  .qbar > i { display: block; height: 100%; border-radius: 3px; }
+  .conf { color: var(--dim); font-size: 11px; width: 62px; text-align: right; font-variant-numeric: tabular-nums; }
+
+  .empty {
+    text-align: center;
+    color: var(--dim);
+    padding: 48px 16px;
+    border: 1px dashed var(--line);
+    border-radius: 8px;
+    font-size: 12.5px;
+  }
+  code {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    padding: 2px 6px;
+    color: var(--accent);
+  }
+
+  @media (max-width: 720px) {
+    .tiles { grid-template-columns: repeat(2, 1fr); }
+    .q .qbar, .q .conf { display: none; }
+  }
+</style>
+</head>
+<body>
+<div class='wrap'>
+  <header>
+    <div>
+      <h1><span>⚡</span> Jev-RS <span class='dim'>/ telemetry</span></h1>
+      <div class='sub'>local System One decision engine · live stream</div>
+    </div>
+    <div style='display:flex; flex-direction:column; gap:8px; align-items:flex-end'>
+      <div id='status' class='badge off'><span class='dot'></span><span>disconnected</span></div>
+      <a href='https://github.com/alnyx-dev/jev-rs' target='_blank' rel='noopener' class='badge gh'>
+        <svg width='13' height='13' viewBox='0 0 16 16' aria-hidden='true'>
+          <path d='M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8z'/>
+        </svg>
+        github
+      </a>
+    </div>
+  </header>
+
+  <section class='tiles'>
+    <div class='tile'><div class='k'>Requests</div><div class='v' id='t-requests'>–</div></div>
+    <div class='tile'><div class='k'>Uptime</div><div class='v' id='t-uptime'>–</div></div>
+    <div class='tile'><div class='k'>Avg Latency</div><div class='v' id='t-avg'>–</div></div>
+    <div class='tile'><div class='k'>Tokens</div><div class='v' id='t-tokens'>–</div></div>
+  </section>
+
+  <section class='card'>
+    <div class='card-title'>
+      <span>Latency Window</span>
+      <span class='dim'>last 40 reqs</span>
+    </div>
+    <div class='chart-wrap'>
+      <div id='chart' class='chart'></div>
+    </div>
+  </section>
+
+  <section class='card'>
+    <div class='card-title'>
+      <span>Live Request Feed</span>
+      <span class='dim'>scrollable · max 50 reqs</span>
+    </div>
+    <div id='feed'>
+      <div class='empty'>
+        Awaiting events — send requests to <code>POST /v1/systemone</code>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+  const feed = document.getElementById('feed');
+  const chart = document.getElementById('chart');
+  const MAX = 40;
+  const MAX_FEED = 50;
+  const latencies = [];
+  let serverStart = 0;
+
+  const el = id => document.getElementById(id);
+  const fmtMs = v => v >= 1000 ? (v / 1000).toFixed(2) + 's' : Math.round(v) + 'ms';
+  const fmtCount = v => v >= 1e9 ? (v / 1e9).toFixed(1) + 'B'
+    : v >= 1e6 ? (v / 1e6).toFixed(1) + 'M'
+    : v >= 1e3 ? (v / 1e3).toFixed(1) + 'k' : String(v);
+  const fmtTime = ts => new Date(ts).toLocaleTimeString(undefined, { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const esc = s => String(s).replace(/[<>&]/g, '');
+  const confColor = p => p >= 0.75 ? 'var(--ok)' : p >= 0.4 ? 'var(--warn)' : 'var(--bad)';
+
+  function getLatencyClass(ms) {
+    if (ms > 600) return 'slow';
+    if (ms > 250) return 'mid';
+    return 'fast';
+  }
+
+  function getBarGradient(ms) {
+    if (ms > 600) return 'linear-gradient(180deg, #f87171, #ef4444)';
+    if (ms > 250) return 'linear-gradient(180deg, #fbbf24, #f59e0b)';
+    return 'linear-gradient(180deg, #38bdf8, #2563eb)';
+  }
+
+  function setTiles(e) {
+    if (e.total_requests !== undefined) el('t-requests').textContent = e.total_requests;
+    if (e.avg_latency_ms !== undefined) el('t-avg').textContent = fmtMs(e.avg_latency_ms);
+    if (e.total_tokens !== undefined) el('t-tokens').textContent = fmtCount(e.total_tokens);
+  }
+
+  function refreshChart() {
+    chart.innerHTML = '';
+    if (!latencies.length) return;
+
+    const maxVal = Math.max(...latencies);
+    const ceiling = Math.max(250, maxVal * 1.25);
+
+    latencies.forEach(ms => {
+      const col = document.createElement('div');
+      col.className = 'bar-col';
+      col.title = fmtMs(ms);
+
+      const b = document.createElement('div');
+      b.className = 'bar';
+      const pct = Math.max(6, Math.min(100, Math.round((ms / ceiling) * 100)));
+      b.style.height = pct + '%';
+      b.style.background = getBarGradient(ms);
+
+      col.appendChild(b);
+      chart.appendChild(col);
+    });
+  }
+
+  function pushBar(ms) {
+    latencies.push(ms);
+    if (latencies.length > MAX) latencies.shift();
+    refreshChart();
+  }
+
+  function answerRow(qid, a) {
+    let chip = a.type, val = '—', conf = null;
+    if (a.type === 'noul') { val = (a.noul * 100).toFixed(1) + '%'; conf = a.noul; }
+    else if (a.type === 'choice') { val = a.choice; conf = a.confidence; }
+    else { val = String(a.score); conf = a.confidence; }
+    
+    let bar = '';
+    if (conf !== null) {
+      const color = confColor(conf);
+      bar = '<span class="qbar"><i style="width:' + Math.round(conf * 100) + '%;background:' + color + '"></i></span>' +
+            '<span class="conf">' + Math.round(conf * 100) + '%</span>';
+    }
+    return '<div class="q">' +
+             '<span class="qid">' + esc(qid) + '</span>' +
+             '<span class="chip">' + esc(chip) + '</span>' +
+             '<span class="val">' + esc(val) + '</span>' +
+             bar +
+           '</div>';
+  }
+
+  function addEntry(e, prepend) {
+    const emptyEl = feed.querySelector('.empty');
+    if (emptyEl) emptyEl.remove();
+
+    let body = '';
+    for (const qid in e.answers) body += answerRow(qid, e.answers[qid]);
+    
+    const latCls = getLatencyClass(e.latency_ms);
+    const d = document.createElement('details');
+    d.className = 'req';
+    d.innerHTML =
+      '<summary>' +
+        '<svg class="chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>' +
+        '<span class="ts">' + fmtTime(e.ts) + '</span>' +
+        '<span class="id">' + esc(e.id) + '</span>' +
+        '<span class="extra">· ' + e.questions + ' Qs · ' + fmtCount(e.tokens) + ' toks</span>' +
+        '<span class="ms ' + latCls + '">' + fmtMs(e.latency_ms) + '</span>' +
+      '</summary>' +
+      (e.state_preview ? '<div class="state-preview">' + esc(e.state_preview) + '</div>' : '') + 
+      body;
+      
+    if (prepend && feed.firstChild) feed.insertBefore(d, feed.firstChild);
+    else feed.appendChild(d);
+    
+    while (feed.children.length > MAX_FEED) feed.removeChild(feed.lastChild);
+  }
+
+  function tickUptime() {
+    if (!serverStart) return;
+    let s = Math.floor((Date.now() - serverStart) / 1000);
+    const h = Math.floor(s / 3600); s %= 3600;
+    const m = Math.floor(s / 60); s %= 60;
+    el('t-uptime').textContent = (h ? h + 'h ' : '') + m + 'm ' + s + 's';
+  }
+
+  setInterval(tickUptime, 1000);
+
+  fetch('/history').then(r => r.json()).then(j => {
+    serverStart = j.server_start_ms;
+    const entries = j.entries || [];
+    
+    // Гарантируем стабильный порядок:
+    const chronological = [...entries].sort((a, b) => a.ts - b.ts);
+    const newestFirst = [...chronological].reverse();
+
+    // В ленту добавляем самые свежие наверх
+    newestFirst.forEach(e => addEntry(e, false));
+
+    // В график добавляем хронологически слева направо
+    chronological.forEach(e => {
+      latencies.push(e.latency_ms);
+      if (latencies.length > MAX) latencies.shift();
+    });
+    refreshChart();
+  }).catch(() => {});
+
+  const es = new EventSource('/events');
+  es.addEventListener('open', () => {
+    const s = el('status');
+    s.className = 'badge on';
+    s.innerHTML = '<span class="dot"></span><span>connected</span>';
+  });
+  es.addEventListener('error', () => {
+    const s = el('status');
+    s.className = 'badge off';
+    s.innerHTML = '<span class="dot"></span><span>reconnecting…</span>';
+  });
+  es.addEventListener('req', ev => {
+    const e = JSON.parse(ev.data);
+    pushBar(e.latency_ms);
+    setTiles(e);
+    addEntry(e, true);
+  });
+</script>
+</body>
+</html>

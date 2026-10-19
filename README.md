@@ -6,6 +6,7 @@
 [![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![ONNX Runtime](https://img.shields.io/badge/ONNX_Runtime-DirectML-blue.svg)](https://onnxruntime.ai/)
+[![GitHub](https://img.shields.io/badge/github-alnyx--dev%2Fjev--rs-181717.svg?logo=github)](https://github.com/alnyx-dev/jev-rs)
 
 Traditional LLMs are slow, non-deterministic, and generate tokens sequentially. **Jev-RS** is a non-autoregressive decision engine that performs batch hypothesis evaluation in a **single forward pass** with zero token generation overhead.
 
@@ -54,6 +55,18 @@ cargo run --release
 ```
 
 Server starts on `http://127.0.0.1:8000`.
+
+> ⚠️ Debug builds won't link on Windows: the downloaded ONNX Runtime binaries use `/MD` (release CRT). Always use `--release`.
+
+### 4. Live Dashboard
+Open **http://127.0.0.1:8000/** — a built-in telemetry page with real-time request feed.
+
+| Route | Description |
+| :--- | :--- |
+| `GET /` | Live dashboard: request feed, latency chart, uptime & stats (SSE-driven) |
+| `GET /events` | Server-Sent Events stream, one `req` event per inference |
+| `GET /history` | Last 50 requests (backfills the dashboard on page load) |
+| `GET /health`, `GET /ready` | Liveness probes |
 
 ---
 

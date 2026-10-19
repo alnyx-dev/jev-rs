@@ -1,3 +1,5 @@
+mod dashboard;
+
 use axum::{
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode},
@@ -5,15 +7,16 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use dashboard::{LogEntry, Stats};
 use ort::ep::DirectML;
 use ort::session::Session;
 use ort::value::Tensor;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, RwLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
 
 // Entailment class index for BGE-M3 / NLI architectures
@@ -73,6 +76,10 @@ struct AppState {
     tokenizer: Tokenizer,
     session: Mutex<Session>,
     temperature: f32,
+    tx: broadcast::Sender<LogEntry>,
+    history: RwLock<Vec<LogEntry>>,
+    stats: RwLock<Stats>,
+    start_ts: u64,
 }
 
 // -----------------------------------------------------------------------------
@@ -246,6 +253,7 @@ async fn handle_systemone(
     }
 
     // 5. Probability calibration & answer compilation
+    let num_questions = tasks.len();
     let mut answers = HashMap::new();
 
     for task in tasks {
@@ -304,6 +312,51 @@ async fn handle_systemone(
     }
 
     let elapsed = start_time.elapsed().as_secs_f64() * 1000.0;
+
+    // 6. Record telemetry entry, push to dashboard subscribers
+    let answers_json = serde_json::to_value(&answers).unwrap_or_default();
+    let tokens_total = (batch_size * seq_len) as u64;
+
+    let (total_requests, total_tokens, avg_latency_ms) = {
+        let mut stats = app.stats.write().unwrap();
+        stats.total += 1;
+        stats.total_tokens += tokens_total;
+        stats.total_latency_ms += elapsed;
+        (stats.total, stats.total_tokens, stats.total_latency_ms / stats.total as f64)
+    };
+
+    let state_preview: String = {
+        let mut s: String = state_text.chars().take(140).collect();
+        if state_text.chars().count() > 140 {
+            s.push('…');
+        }
+        s
+    };
+
+    let entry = LogEntry {
+        id: req_id.clone(),
+        ts: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+        latency_ms: (elapsed * 100.0).round() / 100.0,
+        questions: num_questions as u32,
+        pairs: batch_size,
+        tokens: tokens_total,
+        state_preview,
+        answers: answers_json,
+        total_requests,
+        total_tokens,
+        avg_latency_ms: (avg_latency_ms * 100.0).round() / 100.0,
+    };
+
+    {
+        let mut hist = app.history.write().unwrap();
+        hist.insert(0, entry.clone());
+        hist.truncate(50);
+    }
+    let _ = app.tx.send(entry);
+
     let mut headers = HeaderMap::new();
     headers.insert("x-typesafe-request-id", HeaderValue::from_str(&req_id).unwrap());
     headers.insert("x-response-time-ms", HeaderValue::from_str(&format!("{:.2}", elapsed)).unwrap());
@@ -357,13 +410,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("[+] Engine loaded successfully. Ready for inference.");
 
+    let (tx, _rx) = broadcast::channel::<LogEntry>(64);
     let state = Arc::new(AppState {
         tokenizer,
         session: Mutex::new(session),
         temperature,
+        tx,
+        history: RwLock::new(Vec::new()),
+        stats: RwLock::new(Stats::default()),
+        start_ts: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
     });
 
     let app = Router::new()
+        .route("/", get(dashboard::dashboard))
+        .route("/dashboard", get(dashboard::dashboard))
+        .route("/events", get(dashboard::sse))
+        .route("/history", get(dashboard::history))
         .route("/health", get(|| async { "ready" }))
         .route("/ready", get(|| async { "ready" }))
         .route("/v1/systemone", post(handle_systemone))
