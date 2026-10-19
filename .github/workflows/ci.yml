@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # DirectML GPU acceleration is Windows-only (default features).
+          - os: windows-latest
+            features: ""
+            note: windows / DirectML
+          # CPU-only build for every other platform.
+          - os: ubuntu-latest
+            features: --no-default-features
+            note: linux / CPU
+    name: cargo check (${{ matrix.note }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+
+      - name: Compile check (--release, locked)
+        run: cargo check --release --locked ${{ matrix.features }}
