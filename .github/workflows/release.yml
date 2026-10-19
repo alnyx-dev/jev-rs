@@ -1,16 +1,26 @@
 name: Release
 
 # Build release binaries and publish a GitHub Release when a version tag
-# (v*) is pushed — either manually (`git tag v0.x.y && git push`) or
-# automatically by autotag.yml when the Cargo.toml version changes.
+# (v*) is pushed manually, or when invoked via workflow_call by autotag.yml
+# (GitHub does not run workflows for tags created with the caller's own
+# GITHUB_TOKEN, hence the reusable-entry path).
 
 on:
   push:
     tags:
       - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: "Version tag to release (e.g. v0.2.0)"
+        type: string
+        required: true
 
 permissions:
   contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -54,13 +64,10 @@ jobs:
         run: |
           $bin = "target/${{ matrix.target }}/release/jev-rs.exe"
           New-Item -ItemType Directory -Force dist | Out-Null
-          $name = "jev-rs-$env:GITHUB_REF_NAME-x86_64-windows"
-          Copy-Item README.md, LICENSE -Destination dist -ErrorAction SilentlyContinue
+          $name = "jev-rs-${env:RELEASE_TAG}-x86_64-windows"
           Compress-Archive -Path $bin -DestinationPath "dist/$name.zip"
           $hash = (Get-FileHash -Algorithm SHA256 "dist/$name.zip").Hash.ToLower()
-          "$hash  $name.zip" | Set-Content -NoNewline "dist/$name.zips"
-          Rename-Item "dist/$name.zips" "$name.sha256"
-          Remove-Item dist/README.md, dist/LICENSE -ErrorAction SilentlyContinue
+          "$hash  $name.zip" | Set-Content -NoNewline "dist/$name.sha256"
 
       - name: Package (tar.gz)
         if: runner.os != 'Windows'
@@ -69,8 +76,8 @@ jobs:
           BIN="target/${{ matrix.target }}/release/jev-rs"
           TRIPLE="${{ matrix.target }}"
           if [[ "$TRIPLE" == *aarch64* ]]; then ARCH="aarch64"; else ARCH="$(echo "$TRIPLE" | cut -d- -f1)"; fi
-          OS="$(echo "$TRIPLE" | cut -d- -f3)"
-          NAME="jev-rs-${GITHUB_REF_NAME}-${ARCH}-${OS}"
+          if [[ "$TRIPLE" == *windows* ]]; then OS="windows"; else OS="$(echo "$TRIPLE" | cut -d- -f3)"; fi
+          NAME="jev-rs-${RELEASE_TAG}-${ARCH}-${OS}"
           mkdir -p dist
           tar czf "dist/${NAME}.tar.gz" -C "$(dirname "$BIN")" jev-rs
           ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
@@ -78,7 +85,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Jev-RS ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Jev-RS ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           files: dist/*

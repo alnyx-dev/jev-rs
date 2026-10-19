@@ -17,6 +17,9 @@ permissions:
 jobs:
   tag:
     runs-on: ubuntu-latest
+    outputs:
+      created: ${{ steps.create.outputs.created }}
+      version: ${{ steps.ver.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,12 +33,26 @@ jobs:
           echo "Cargo.toml version: $VERSION"
 
       - name: Create tag if missing
+        id: create
         run: |
           TAG="v${{ steps.ver.outputs.version }}"
           if git rev-parse "$TAG" >/dev/null 2>&1; then
             echo "Tag $TAG already exists — nothing to do."
+            echo "created=false" >> "$GITHUB_OUTPUT"
           else
             git tag "$TAG" "${{ github.sha }}"
             git push origin "$TAG"
-            echo "Created and pushed tag $TAG (release pipeline will now build it)."
+            echo "Created and pushed tag $TAG."
+            echo "created=true" >> "$GITHUB_OUTPUT"
           fi
+
+  # Note: the tag push itself cannot trigger release.yml (GitHub blocks
+  # tag events created with the workflow's own GITHUB_TOKEN), so the
+  # release build is invoked here directly via `workflow_call`.
+  release:
+    needs: tag
+    if: needs.tag.outputs.created == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: v${{ needs.tag.outputs.version }}
+    secrets: inherit
