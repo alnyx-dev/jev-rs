@@ -56,7 +56,10 @@ pub async fn dashboard() -> Html<&'static str> {
 }
 
 pub async fn history(State(app): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let entries = app.history.read().unwrap().clone();
+    let entries = app.history
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     Json(serde_json::json!({
         "server_start_ms": app.start_ts,
         "entries": entries,

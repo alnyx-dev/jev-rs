@@ -1,25 +1,28 @@
 mod dashboard;
 
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use dashboard::{LogEntry, Stats};
+#[cfg(feature = "dml")]
 use ort::ep::DirectML;
 use ort::session::Session;
 use ort::value::Tensor;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokenizers::Tokenizer;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Semaphore};
 use uuid::Uuid;
 
-// Entailment class index for BGE-M3 / NLI architectures
+// Fallback entailment class index for BGE-M3-style NLI exports. Only used
+// when the model's config.json cannot provide the real mapping (see
+// `resolve_entailment_index`).
 const ENTAILMENT_IDX: usize = 0;
 
 // -----------------------------------------------------------------------------
@@ -37,7 +40,7 @@ struct QuestionSchema {
 struct SystemOneRequest {
     model: Option<String>,
     state: serde_json::Value,
-    questions: HashMap<String, QuestionSchema>,
+    questions: BTreeMap<String, QuestionSchema>,
 }
 
 #[derive(Debug, Serialize)]
@@ -52,14 +55,14 @@ enum AnswerValue {
         #[serde(rename = "type")]
         q_type: String,
         choice: String,
-        probabilities: HashMap<String, f32>,
+        probabilities: BTreeMap<String, f32>,
         confidence: f32,
     },
     Score {
         #[serde(rename = "type")]
         q_type: String,
         score: f32,
-        probabilities: HashMap<String, f32>,
+        probabilities: BTreeMap<String, f32>,
         confidence: f32,
     },
 }
@@ -68,14 +71,25 @@ enum AnswerValue {
 struct SystemOneResponse {
     id: String,
     model: String,
-    answers: HashMap<String, AnswerValue>,
+    answers: BTreeMap<String, AnswerValue>,
     usage: serde_json::Value,
 }
 
 struct AppState {
     tokenizer: Tokenizer,
-    session: Mutex<Session>,
+    /// Arc-wrapped so the guard can be owned ('static) inside the
+    /// spawn_blocking closure running the forward pass.
+    session: Arc<Mutex<Session>>,
     temperature: f32,
+    /// Resolved ONNX output name for the classification logits
+    /// (validated at startup; usually "logits").
+    logits_name: String,
+    /// Entailment class index resolved from the model's config.json.
+    entailment_idx: usize,
+    /// Per-request inference timeout in seconds (JEV_TIMEOUT).
+    inference_timeout: u64,
+    /// Limits concurrent forward passes; excess requests get 503 (JEV_MAX_CONCURRENCY).
+    inference_permits: Arc<Semaphore>,
     tx: broadcast::Sender<LogEntry>,
     history: RwLock<Vec<LogEntry>>,
     stats: RwLock<Stats>,
@@ -91,6 +105,62 @@ fn softmax(logits: &[f32], temperature: f32) -> Vec<f32> {
     let exps: Vec<f32> = scaled.iter().map(|&x| (x - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
     exps.iter().map(|&x| (x / sum * 10000.0).round() / 10000.0).collect()
+}
+
+/// Uniform 400-response for malformed wire-protocol payloads.
+fn bad_request(msg: impl Into<String>) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, msg.into())
+}
+
+/// Determine the NLI entailment class index from the exported model's
+/// config.json (`id2label`), instead of hardcoding it. Recognizes both
+/// classical NLI labeling ("entailment") and binary zeroshot exports where
+/// the entailment class is labeled "true". Falls back to `ENTAILMENT_IDX`
+/// with a warning when the config is missing or unrecognized.
+fn resolve_entailment_index(model_path: &str) -> usize {
+    let fallback = || {
+        println!(
+            "[!] config.json has no recognizable NLI labels; defaulting entailment index to {}",
+            ENTAILMENT_IDX
+        );
+        ENTAILMENT_IDX
+    };
+
+    let config_path = std::path::Path::new(model_path).with_file_name("config.json");
+    if !config_path.exists() {
+        println!(
+            "[!] config.json not found next to '{}'; defaulting entailment index to {}",
+            model_path, ENTAILMENT_IDX
+        );
+        return ENTAILMENT_IDX;
+    }
+
+    let config = match std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    {
+        Some(v) => v,
+        None => return fallback(),
+    };
+
+    if let Some(map) = config.get("id2label").and_then(|v| v.as_object()) {
+        for (k, v) in map {
+            let label = match v.as_str() {
+                Some(l) => l.to_lowercase(),
+                None => continue,
+            };
+            if label.contains("entailment") || label == "true" {
+                if let Ok(idx) = k.parse::<usize>() {
+                    println!(
+                        "[*] Entailment label: '{}' at index {} (from id2label)",
+                        label, idx
+                    );
+                    return idx;
+                }
+            }
+        }
+    }
+    fallback()
 }
 
 fn compute_confidence(probs: &[f32]) -> f32 {
@@ -157,18 +227,45 @@ async fn handle_systemone(
             }
             "choice" => {
                 let mut keys = Vec::new();
-                if let Some(serde_json::Value::Object(map)) = &q.criteria {
-                    for (k, v) in map {
-                        keys.push(k.clone());
-                        let desc = v.as_str().unwrap_or("");
-                        premise_hypo_pairs.push((state_text.clone(), format!("{}: {}", instr, desc)));
+                match &q.criteria {
+                    Some(serde_json::Value::Object(map)) => {
+                        for (k, v) in map {
+                            let desc = v.as_str().ok_or_else(|| {
+                                bad_request(format!(
+                                    "question '{}': 'choice' criteria values must be strings",
+                                    q_id
+                                ))
+                            })?;
+                            keys.push(k.clone());
+                            premise_hypo_pairs
+                                .push((state_text.clone(), format!("{}: {}", instr, desc)));
+                        }
                     }
-                } else if let Some(serde_json::Value::Array(arr)) = &q.criteria {
-                    for v in arr {
-                        let desc = v.as_str().unwrap_or("");
-                        keys.push(desc.to_string());
-                        premise_hypo_pairs.push((state_text.clone(), format!("{}: {}", instr, desc)));
+                    Some(serde_json::Value::Array(arr)) => {
+                        for v in arr {
+                            let desc = v.as_str().ok_or_else(|| {
+                                bad_request(format!(
+                                    "question '{}': 'choice' criteria array items must be strings",
+                                    q_id
+                                ))
+                            })?;
+                            keys.push(desc.to_string());
+                            premise_hypo_pairs
+                                .push((state_text.clone(), format!("{}: {}", instr, desc)));
+                        }
                     }
+                    _ => {
+                        return Err(bad_request(format!(
+                            "question '{}': type 'choice' requires a 'criteria' object or array of strings",
+                            q_id
+                        )));
+                    }
+                }
+                if keys.is_empty() {
+                    return Err(bad_request(format!(
+                        "question '{}': 'choice' criteria must not be empty",
+                        q_id
+                    )));
                 }
                 tasks.push(TaskMeta {
                     id: q_id.clone(),
@@ -179,12 +276,33 @@ async fn handle_systemone(
             }
             "score" => {
                 let mut levels = Vec::new();
-                if let Some(serde_json::Value::Array(arr)) = &q.criteria {
-                    for v in arr {
-                        levels.push(v.as_str().unwrap_or("").to_string());
+                match &q.criteria {
+                    Some(serde_json::Value::Array(arr)) => {
+                        for v in arr {
+                            let lvl = v.as_str().ok_or_else(|| {
+                                bad_request(format!(
+                                    "question '{}': 'score' criteria array items must be strings",
+                                    q_id
+                                ))
+                            })?;
+                            levels.push(lvl.to_string());
+                        }
+                        if levels.is_empty() {
+                            return Err(bad_request(format!(
+                                "question '{}': 'score' criteria must not be empty",
+                                q_id
+                            )));
+                        }
                     }
-                } else {
-                    levels = vec!["Low".into(), "Medium".into(), "High".into()];
+                    // No criteria: use a sensible ordinal default backwards-compatible
+                    // with the previous behavior.
+                    None => levels = vec!["Low".into(), "Medium".into(), "High".into()],
+                    _ => {
+                        return Err(bad_request(format!(
+                            "question '{}': type 'score' requires 'criteria' as an array of strings",
+                            q_id
+                        )));
+                    }
                 }
                 for lvl in &levels {
                     premise_hypo_pairs.push((state_text.clone(), format!("{}: {}", instr, lvl)));
@@ -196,16 +314,44 @@ async fn handle_systemone(
                     kind: TaskKind::Score { levels },
                 });
             }
-            _ => return Err((StatusCode::BAD_REQUEST, format!("Unsupported question type: {}", q.q_type))),
+            _ => {
+                return Err(bad_request(format!(
+                    "Unsupported question type: {}",
+                    q.q_type
+                )));
+            }
         }
     }
 
-    // 2. Vectorized batch tokenization
-    let token_inputs: Vec<(&str, &str)> = premise_hypo_pairs.iter().map(|(p, h)| (p.as_str(), h.as_str())).collect();
-    let encodings = app
-        .tokenizer
-        .encode_batch(token_inputs, true)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Guard: an empty questions map (or questions that produced no evaluation
+    // pairs) would otherwise panic on `encodings[0]` below.
+    if premise_hypo_pairs.is_empty() {
+        return Err(bad_request(
+            "Request must contain at least one valid question that produces evaluation pairs",
+        ));
+    }
+
+    // 2. Vectorized batch tokenization. CPU-bound — offloaded to the blocking
+    // pool so async worker threads stay responsive for /health, SSE, etc.
+    let encodings = {
+        let pairs = std::mem::take(&mut premise_hypo_pairs);
+        let app_ref = Arc::clone(&app);
+        match tokio::task::spawn_blocking(move || {
+            let token_inputs: Vec<(&str, &str)> =
+                pairs.iter().map(|(p, h)| (p.as_str(), h.as_str())).collect();
+            app_ref.tokenizer.encode_batch(token_inputs, true)
+        })
+        .await
+        {
+            Ok(res) => res.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Tokenization task failed: {}", e),
+                ))
+            }
+        }
+    };
 
     let batch_size = encodings.len();
     let seq_len = encodings[0].get_ids().len();
@@ -222,6 +368,10 @@ async fn handle_systemone(
         }
     }
 
+    // Real (unpadded) token count across the whole batch — for usage accounting
+    // and telemetry instead of the padded `batch_size * seq_len`.
+    let real_tokens = flat_attention_mask.iter().filter(|&&m| m == 1).count() as u64;
+
     // 3. Tensor creation
     let shape = [batch_size, seq_len];
     let input_ids_tensor = Tensor::from_array((shape, flat_input_ids))
@@ -229,32 +379,91 @@ async fn handle_systemone(
     let attention_mask_tensor = Tensor::from_array((shape, flat_attention_mask))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let inputs = ort::inputs![
-        "input_ids" => input_ids_tensor,
-        "attention_mask" => attention_mask_tensor,
-    ];
+    // 4. Single forward pass (GPU / DirectML). Offloaded to the blocking pool
+    // so the async runtime stays responsive; bounded by a concurrency permit
+    // (overload -> 503) and a per-request timeout (-> 504).
+    // Logits extraction & shape validation happen inside the closure because
+    // the run output borrows the session guard.
+    let _permit = app
+        .inference_permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server busy: too many concurrent inferences".to_string(),
+            )
+        })?;
 
-    // 4. Single forward pass (GPU / DirectML)
-    let mut session = app.session.lock().await;
-    let outputs = session
-        .run(inputs)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let entail_idx = app.entailment_idx;
+    let logits_name = app.logits_name.clone();
+    let session_mutex = Arc::clone(&app.session);
+    let mut session_guard = session_mutex.lock_owned().await;
 
-    let (out_shape, logits_data) = outputs["logits"]
-        .try_extract_tensor::<f32>()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let run_result = tokio::time::timeout(
+        Duration::from_secs(app.inference_timeout),
+        tokio::task::spawn_blocking(move || -> Result<Vec<f32>, String> {
+            let inputs = ort::inputs![
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+            ];
+            let outputs = session_guard.run(inputs).map_err(|e| e.to_string())?;
+            let (out_shape, logits_data) = outputs[logits_name.as_str()]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| e.to_string())?;
 
-    let num_rows = out_shape[0] as usize;
-    let num_classes = out_shape[1] as usize;
+            // Guard: the output must be a 2D classification result
+            // [batch, num_classes]; return owned entailment logits.
+            if out_shape.len() != 2 {
+                return Err(format!(
+                    "Model output must be 2D [batch, num_classes], got rank {}",
+                    out_shape.len()
+                ));
+            }
+            let num_rows = out_shape[0] as usize;
+            let num_classes = out_shape[1] as usize;
+            if num_classes <= entail_idx {
+                return Err(format!(
+                    "Model has {} classes, but entailment index {} is required",
+                    num_classes, entail_idx
+                ));
+            }
+            if num_rows != batch_size {
+                return Err(format!(
+                    "Model output batch mismatch: got {} rows for a batch of {}",
+                    num_rows, batch_size
+                ));
+            }
 
-    let mut entail_logits: Vec<f32> = Vec::with_capacity(num_rows);
-    for i in 0..num_rows {
-        entail_logits.push(logits_data[i * num_classes + ENTAILMENT_IDX]);
-    }
+            let mut entail_logits = Vec::with_capacity(num_rows);
+            for i in 0..num_rows {
+                entail_logits.push(logits_data[i * num_classes + entail_idx]);
+            }
+            Ok(entail_logits)
+        }),
+    )
+    .await;
+
+    let entail_logits = match run_result {
+        Err(_) => {
+            return Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("Inference timed out after {}s", app.inference_timeout),
+            ))
+        }
+        Ok(Err(join_err)) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Inference task failed: {}", join_err),
+            ))
+        }
+        Ok(Ok(Err(e))) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
+        Ok(Ok(Ok(entail))) => entail,
+    };
 
     // 5. Probability calibration & answer compilation
     let num_questions = tasks.len();
-    let mut answers = HashMap::new();
+    let mut answers = BTreeMap::new();
 
     for task in tasks {
         let task_logits = &entail_logits[task.start..task.end];
@@ -271,7 +480,7 @@ async fn handle_systemone(
                 );
             }
             TaskKind::Choice { keys } => {
-                let mut prob_map = HashMap::new();
+                let mut prob_map = BTreeMap::new();
                 let mut best_idx = 0;
                 let mut max_p = -1.0;
                 for (i, k) in keys.iter().enumerate() {
@@ -292,7 +501,7 @@ async fn handle_systemone(
                 );
             }
             TaskKind::Score { levels } => {
-                let mut prob_map = HashMap::new();
+                let mut prob_map = BTreeMap::new();
                 let mut exp_score = 0.0;
                 for (i, lvl) in levels.iter().enumerate() {
                     prob_map.insert(lvl.clone(), probs[i]);
@@ -315,10 +524,12 @@ async fn handle_systemone(
 
     // 6. Record telemetry entry, push to dashboard subscribers
     let answers_json = serde_json::to_value(&answers).unwrap_or_default();
-    let tokens_total = (batch_size * seq_len) as u64;
+    let tokens_total = real_tokens;
 
     let (total_requests, total_tokens, avg_latency_ms) = {
-        let mut stats = app.stats.write().unwrap();
+        let mut stats = app.stats
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         stats.total += 1;
         stats.total_tokens += tokens_total;
         stats.total_latency_ms += elapsed;
@@ -351,7 +562,9 @@ async fn handle_systemone(
     };
 
     {
-        let mut hist = app.history.write().unwrap();
+        let mut hist = app.history
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         hist.insert(0, entry.clone());
         hist.truncate(50);
     }
@@ -366,7 +579,7 @@ async fn handle_systemone(
         model: payload.model.unwrap_or_else(|| "local-jev-rust".into()),
         answers,
         usage: serde_json::json!({
-            "input_tokens": seq_len,
+            "input_tokens": real_tokens,
             "output_tokens": 0
         }),
     };
@@ -380,10 +593,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8000".into());
     let model_path = std::env::var("JEV_MODEL_PATH").unwrap_or_else(|_| "model_onnx/model.onnx".into());
     let tokenizer_path = std::env::var("JEV_TOKENIZER_PATH").unwrap_or_else(|_| "model_onnx/tokenizer.json".into());
-    let temperature = std::env::var("JEV_TEMPERATURE")
+    let temperature = {
+        let t = std::env::var("JEV_TEMPERATURE")
+            .ok()
+            .and_then(|t| t.parse::<f32>().ok())
+            .unwrap_or(1.65);
+        if !t.is_finite() || t <= 0.0 || t > 10.0 {
+            return Err(format!(
+                "Invalid JEV_TEMPERATURE = {} (must be finite and within 0 < t <= 10)",
+                t
+            )
+            .into());
+        }
+        t
+    };
+
+    let max_body = std::env::var("JEV_MAX_BODY_BYTES")
         .ok()
-        .and_then(|t| t.parse::<f32>().ok())
-        .unwrap_or(1.65);
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(128 * 1024);
+    let max_concurrency = std::env::var("JEV_MAX_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2);
+    let inference_timeout = std::env::var("JEV_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(30);
 
     println!("============================================================");
     println!(" ⚡ Jev-RS: High-Performance System One Decision Engine");
@@ -391,6 +630,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[*] Tokenizer path:  {}", tokenizer_path);
     println!("[*] Model ONNX path: {}", model_path);
     println!("[*] Calibration T:   {}", temperature);
+    println!("[*] Limits: body <= {} B, concurrency = {}, timeout = {} s",
+        max_body, max_concurrency, inference_timeout);
 
     let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
         .unwrap_or_else(|_| panic!("Failed to load tokenizer from '{}'. Run 'python scripts/setup_model.py' first!", tokenizer_path));
@@ -401,20 +642,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let environment = ort::init().build()?;
 
-    let session = Session::builder(&environment)?
-        .with_execution_providers([DirectML::default().build()])?
-        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
-        .with_intra_threads(threads)?
-        .commit_from_file(&model_path)
-        .unwrap_or_else(|_| panic!("Failed to load model from '{}'. Run 'python scripts/setup_model.py' first!", model_path));
+    #[cfg(feature = "dml")]
+    let session = {
+        println!("[*] Execution provider: DirectML (GPU)");
+        Session::builder(&environment)?
+            .with_execution_providers([DirectML::default().build()])?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
+            .with_intra_threads(threads)?
+            .commit_from_file(&model_path)
+            .unwrap_or_else(|_| panic!("Failed to load model from '{}'. Run 'python scripts/setup_model.py' first!", model_path))
+    };
+    #[cfg(not(feature = "dml"))]
+    let session = {
+        println!("[*] Execution provider: CPU");
+        Session::builder(&environment)?
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
+            .with_intra_threads(threads)?
+            .commit_from_file(&model_path)
+            .unwrap_or_else(|_| panic!("Failed to load model from '{}'. Run 'python scripts/setup_model.py' first!", model_path))
+    };
+
+    // Resolve the logits output name from the model signature instead of
+    // hardcoding it: prefer "logits", otherwise accept the sole output.
+    let logits_name = {
+        let names: Vec<String> = session
+            .outputs()
+            .iter()
+            .map(|o| o.name().to_string())
+            .collect();
+        if names.iter().any(|n| n == "logits") {
+            "logits".to_string()
+        } else if names.len() == 1 {
+            names[0].clone()
+        } else {
+            return Err(format!(
+                "Model output 'logits' not found (outputs: {:?}); model '{}' is not a valid NLI classification export. Re-run 'python scripts/setup_model.py'.",
+                names, model_path
+            )
+            .into());
+        }
+    };
+    println!("[*] Logits output:    {}", logits_name);
+
+    // Resolve the entailment class index from the model's config.json (H4):
+    // hardcoded guesses silently break NLI ordering for other exports.
+    let entailment_idx = resolve_entailment_index(&model_path);
+
+    // Warm-up inference: validate output shape & entailment indexing before
+    // serving any traffic, so a bad ONNX export fails fast with a clear error.
+    let mut session = session;
+    {
+        let shape = [1usize, 8usize];
+        let warmup_ids = Tensor::from_array((shape, vec![0i64; 8]))?;
+        let warmup_mask = Tensor::from_array((shape, vec![0i64; 8]))?;
+        let outputs = session.run(ort::inputs![
+            "input_ids" => warmup_ids,
+            "attention_mask" => warmup_mask,
+        ])?;
+        let (out_shape, _) = outputs[logits_name.as_str()]
+            .try_extract_tensor::<f32>()?;
+        if out_shape.len() != 2 {
+            return Err(format!(
+                "Model output must be 2D [batch, num_classes], got rank {}",
+                out_shape.len()
+            )
+            .into());
+        }
+        if (out_shape[1] as usize) <= entailment_idx {
+            return Err(format!(
+                "Model has {} classes, but entailment index {} is required; wrong NLI export. Re-run 'python scripts/setup_model.py'.",
+                out_shape[1], entailment_idx
+            )
+            .into());
+        }
+        println!(
+            "[+] Warm-up OK: logits shape [{}, {}]",
+            out_shape[0], out_shape[1]
+        );
+    }
 
     println!("[+] Engine loaded successfully. Ready for inference.");
 
     let (tx, _rx) = broadcast::channel::<LogEntry>(64);
     let state = Arc::new(AppState {
         tokenizer,
-        session: Mutex::new(session),
+        session: Arc::new(Mutex::new(session)),
         temperature,
+        logits_name,
+        entailment_idx,
+        inference_timeout,
+        inference_permits: Arc::new(Semaphore::new(max_concurrency)),
         tx,
         history: RwLock::new(Vec::new()),
         stats: RwLock::new(Stats::default()),
@@ -432,9 +749,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(|| async { "ready" }))
         .route("/ready", get(|| async { "ready" }))
         .route("/v1/systemone", post(handle_systemone))
-        .with_state(state);
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(max_body));
 
     let bind_addr = format!("{}:{}", host, port);
+    let loopback = host == "localhost"
+        || host == "::1"
+        || host.starts_with("127.");
+    let remote_allowed = std::env::var("JEV_ALLOW_REMOTE").is_ok();
+    if !loopback && !remote_allowed {
+        println!(
+            "[!] WARNING: binding to non-loopback host '{}'; the API has no auth / rate-limiting. Set JEV_ALLOW_REMOTE=1 to acknowledge.",
+            host
+        );
+    }
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     println!("[+] Server listening on http://{}", bind_addr);
     println!("============================================================");
