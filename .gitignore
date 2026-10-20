@@ -2,6 +2,10 @@
 target/
 **/*.rs.bk
 
+# Python virtual environment (created by install.bat)
+.venv/
+venv/
+
 # Model weights & ONNX binaries (downloaded via scripts/setup_model.py)
 model_onnx/
 *.onnx

@@ -87,6 +87,24 @@ cargo build --release                  # Windows: DirectML GPU
 ./target/release/jev-rs
 ```
 
+### 🪟 Windows quick start
+
+Two batch scripts do everything for you:
+
+| Script | What it does |
+| :--- | :--- |
+| **`install.bat`** | one-time setup: creates a `.venv`, installs `optimum`/`transformers`/`torch`, exports the ONNX model (`model_onnx\`, ~2.3 GB), installs Rust if missing, builds the release binary |
+| **`run.bat`** | starts the server and opens the live dashboard in the browser |
+
+```bat
+install.bat        :: run once
+run.bat            :: start the engine (Ctrl+C to stop)
+```
+
+Skip parts of the installation with `JEV_SKIP_PIP=1`, `JEV_SKIP_MODEL=1` or
+`JEV_SKIP_RUST=1`. `run.bat` honours `PORT`, `HOST`, `JEV_MODEL_PATH`,
+`JEV_TOKENIZER_PATH`, `JEV_TEMPERATURE` and the other `JEV_*` settings.
+
 ### Model files
 
 The model is ~2.3 GB, so it is never shipped with a release. Export it once
