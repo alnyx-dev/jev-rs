@@ -3,8 +3,7 @@ name: Release
 # Publishes a GitHub Release for a version tag.
 #
 # Assets:
-#   * jev-rs-windows-x86_64.zip  — prebuilt Windows binary (DirectML) + docs,
-#     used by the download installer (install.bat)
+#   * jev-rs-windows-x86_64.zip — prebuilt Windows binary (DirectML) + docs
 #   * source archives (zip/tar.gz) — attached by GitHub automatically
 #
 # The tag can be pushed manually (`git tag v0.x.y && git push`) or created
@@ -58,23 +57,6 @@ jobs:
           "$hash  ${{ env.ASSET_NAME }}" | Set-Content -NoNewline "dist/${{ env.ASSET_NAME }}.sha256"
           Remove-Item "dist/stage" -Recurse -Force
 
-      - name: Install Inno Setup
-        run: choco install innosetup -y --no-progress
-
-      - name: Build GUI installer
-        shell: pwsh
-        run: |
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          if (-not (Test-Path $iscc)) { $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe" }
-          $version = "${{ env.RELEASE_TAG }}" -replace '^v', ''
-          # The Inno script writes straight into <repo>\dist (OutputDir=..\dist).
-          & $iscc "/DAppVersion=$version" "installer\jev-rs.iss"
-          if ($LASTEXITCODE -ne 0) { throw "Inno Setup build failed" }
-          $setup = Get-ChildItem "dist\jev-rs-setup-*.exe" | Select-Object -First 1
-          if (-not $setup) { throw "Installer binary was not produced" }
-          "Installer: $($setup.Name) ($([math]::Round($setup.Length / 1MB, 2)) MB)"
-          Get-ChildItem dist | Select-Object Name, Length
-
       - uses: actions/upload-artifact@v4
         with:
           name: release-assets
@@ -98,10 +80,10 @@ jobs:
           name: Jev-RS ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           body: |
-            **Windows users:** download `jev-rs-setup-<version>.exe` — a real
-            installer with a folder picker, shortcuts and an optional one-click
-            model download (~2.3 GB). The plain `jev-rs-windows-x86_64.zip` is
-            the portable variant.
+            **Windows users:** download `jev-rs-windows-x86_64.zip` — the portable
+            build of the engine (DirectML). Extract it, place the `model_onnx`
+            folder next to `jev-rs.exe` (or point `JEV_MODEL_PATH` /
+            `JEV_TOKENIZER_PATH` at an existing model) and run the binary.
 
             **Build from source:**
 

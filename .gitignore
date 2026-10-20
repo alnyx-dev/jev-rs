@@ -2,9 +2,6 @@
 target/
 **/*.rs.bk
 
-# Installer build output (dist\jev-rs-setup-*.exe)
-dist/
-
 # Python virtual environment (created by install.bat)
 .venv/
 venv/
