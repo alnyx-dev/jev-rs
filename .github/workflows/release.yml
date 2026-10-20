@@ -57,6 +57,10 @@ jobs:
 
       - name: Build (--release, locked)
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.features }}
+        env:
+          # ORT's prebuilt macOS static libs are built with a newer SDK than
+          # rustc's default deployment target for aarch64; align it.
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
 
       - name: Package (zip)
         if: runner.os == 'Windows'

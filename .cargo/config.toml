@@ -4,3 +4,24 @@ rustflags = [
     "-C", "link-arg=/NODEFAULTLIB:libcpmt.lib",
     "-C", "link-arg=/NODEFAULTLIB:libcmt.lib"
 ]
+
+# ONNX Runtime's prebuilt macOS static libraries are compiled with a newer SDK
+# and reference the availability runtime helpers, which the linker cannot
+# resolve at the default deployment target. They are only used by the CoreML
+# execution provider, so allowing them to stay undefined is safe for the
+# CPU provider (and the symbols are never called at runtime).
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-Wl,-U,___isPlatformVersionAtLeast",
+    "-C", "link-arg=-Wl,-U,___isPlatformVariantAtLeast",
+    "-C", "link-arg=-Wl,-U,___isPlatformVariantBetween",
+    "-C", "link-arg=-Wl,-U,___isPlatformAtLeastCore2"
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+    "-C", "link-arg=-Wl,-U,___isPlatformVersionAtLeast",
+    "-C", "link-arg=-Wl,-U,___isPlatformVariantAtLeast",
+    "-C", "link-arg=-Wl,-U,___isPlatformVariantBetween",
+    "-C", "link-arg=-Wl,-U,___isPlatformAtLeastCore2"
+]
