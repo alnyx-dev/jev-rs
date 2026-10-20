@@ -517,6 +517,11 @@
 
     newestFirst.forEach(e => addEntry(e, false));
 
+    // The tiles are normally filled by the event stream; on a cold page load
+    // they come from the newest backfilled entry.
+    if (newestFirst.length) setTiles(newestFirst[0]);
+    tickUptime();
+
     chronological.forEach(e => {
       latencies.push(e.latency_ms);
       if (latencies.length > MAX) latencies.shift();
