@@ -1,4 +1,5 @@
 mod dashboard;
+mod download;
 
 use axum::{
     extract::{rejection::JsonRejection, DefaultBodyLimit, State},
@@ -1223,11 +1224,18 @@ fn print_help() {
         env!("CARGO_PKG_VERSION")
     );
     println!();
-    println!("Usage: jev-rs [--help] [--version]");
+    println!("Usage: jev-rs [--help] [--version] [--download-model [repo]]");
     println!();
     println!("Options:");
-    println!("  -h, --help       print this help");
-    println!("  -V, --version    print the version");
+    println!("  -h, --help           print this help");
+    println!("  -V, --version        print the version");
+    println!("      --download-model [repo]");
+    println!("                       fetch the pre-exported ONNX bundle into model_onnx/");
+    println!(
+        "                       (default repo: {})",
+        download::DEFAULT_REPO
+    );
+    println!("                       add --force to re-download existing files");
     println!();
     println!("Configuration (environment variables):");
     println!("  HOST, PORT                       bind address and port");
@@ -1327,6 +1335,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("jev-rs {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--download-model") {
+        // The repository is the optional argument right after the flag.
+        let repo = args
+            .get(pos + 1)
+            .filter(|a| !a.starts_with('-'))
+            .cloned()
+            .unwrap_or_else(|| download::DEFAULT_REPO.to_string());
+        let force = args.iter().any(|a| a == "--force");
+        let dir = download::default_model_dir();
+        download::download_model(&repo, &dir, force).map_err(PlainError)?;
         return Ok(());
     }
 

@@ -66,6 +66,8 @@ and an explicit confidence value.
   decisions are evaluated in parallel.
 - **Wire-compatible** — drop-in local replacement for the TypeSafe AI API
   (`POST /v1/systemone`).
+- **One toolchain** — Rust only: the model is a pre-exported ONNX bundle that
+  the engine downloads itself. No Python, no torch, no virtualenv.
 - **Typed primitives** — `noul` (binary), `choice` (categorical) and `score`
   (ordered rubric) in one request.
 - **Calibrated probabilities** — RLCD-style temperature scaling removes neural
@@ -87,25 +89,25 @@ and an explicit confidence value.
 ### Windows
 
 ```bat
-install.bat        :: one-time setup: venv, model export, Rust, release build
+install.bat        :: one-time setup: Rust, release build, model download
 run.bat            :: start the engine (Ctrl+C to stop)
 ```
 
-`install.bat` creates a `.venv`, installs `optimum`/`transformers`/`torch`,
-exports the ONNX model into `model_onnx\` (~2.3 GB), installs Rust if needed
-and builds the release binary. Skip parts with `JEV_SKIP_PIP=1`,
-`JEV_SKIP_MODEL=1` or `JEV_SKIP_RUST=1`.
+`install.bat` installs Rust if needed, builds the release binary and downloads
+the model — a pre-exported ONNX bundle (~2.3 GB) straight from the Hugging
+Face Hub. **No Python, no virtualenv, no torch.** The download is resumable:
+if the connection drops, run `install.bat` again and it continues where it
+stopped. Skip parts with `JEV_SKIP_MODEL=1` or `JEV_SKIP_RUST=1`.
 
 ### Any platform
 
 ```bash
-# 1. Export the model once (Python)
-pip install optimum[onnxruntime] transformers torch
-python scripts/setup_model.py
-
-# 2. Build
+# 1. Build
 cargo build --release                        # Windows: DirectML GPU
 # cargo build --release --no-default-features # Linux / macOS: CPU
+
+# 2. Fetch the model (once, ~2.3 GB)
+./target/release/jev-rs --download-model
 
 # 3. Run
 ./target/release/jev-rs
@@ -116,9 +118,14 @@ The server listens on `http://127.0.0.1:8000`.
 > ⚠️ **Windows:** always build with `--release`. The ONNX Runtime binaries are
 > built against the release CRT (`/MD`), so debug builds do not link.
 >
-> **Model placement:** the engine looks for `model_onnx/` in the working
+> ⚠️ **Model placement:** the engine looks for `model_onnx/` in the working
 > directory and then next to the executable; `JEV_MODEL_PATH` /
 > `JEV_TOKENIZER_PATH` override both.
+>
+> ℹ️ **Another model?** `--download-model <repo>` fetches the ONNX bundle of
+> any Hugging Face repository that ships one (the files must live in its
+> `onnx/` folder). For a model without a pre-built export, `scripts/setup_model.py`
+> converts it with `optimum` — that is the only place Python is still needed.
 
 ---
 
@@ -324,10 +331,11 @@ no feed. Only the anonymous counters (requests, latency, tokens) remain.
 jev-rs/
 ├── src/
 │   ├── main.rs          # HTTP server, batched inference, calibration
+│   ├── download.rs      # ONNX bundle download from the Hugging Face Hub
 │   ├── dashboard.rs     # SSE + history endpoints
 │   └── dashboard.html   # self-contained telemetry page
 ├── scripts/
-│   ├── setup_model.py   # ONNX export + IO validation
+│   ├── setup_model.py   # optional: ONNX export for custom models
 │   ├── test_request.ps1 # smoke test (PowerShell)
 │   └── test_request.sh  # smoke test (bash)
 ├── .cargo/config.toml   # MSVC linker flags, macOS availability symbols

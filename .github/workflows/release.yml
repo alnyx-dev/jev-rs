@@ -88,13 +88,14 @@ jobs:
             **Build from source:**
 
             ```bash
-            pip install optimum[onnxruntime] transformers torch
-            python scripts/setup_model.py          # one-time ONNX export
             cargo build --release                  # Windows: DirectML GPU
             # cargo build --release --no-default-features   # Linux/macOS: CPU
+            ./target/release/jev-rs --download-model         # fetch the model (~2.3 GB)
             ./target/release/jev-rs
             ```
 
-            The server looks for `model_onnx/` in the working directory and next
-            to the executable; override with `JEV_MODEL_PATH` / `JEV_TOKENIZER_PATH`.
+            The engine downloads a pre-exported ONNX bundle from the Hugging Face
+            Hub — no Python and no virtualenv required. The server looks for
+            `model_onnx/` in the working directory and next to the executable;
+            override with `JEV_MODEL_PATH` / `JEV_TOKENIZER_PATH`.
           files: dist/*

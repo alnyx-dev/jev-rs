@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
 """
-Model preparation script for Jev-RS.
-Exports a HuggingFace NLI / zeroshot model to ONNX and validates the export
-against Jev-RS's single-forward-pass expectations (input_ids, attention_mask
-inputs; classification logits output).
+Optional: export a custom HuggingFace model to ONNX for Jev-RS.
+
+The reference model ships a pre-built ONNX export, so the normal setup needs
+no Python at all:
+
+    cargo build --release
+    ./target/release/jev-rs --download-model
+
+This script is only needed for a model that does NOT publish an ONNX export.
+It converts the model and validates the export against Jev-RS's
+single-forward-pass expectations (input_ids, attention_mask inputs;
+classification logits output).
+
+    pip install optimum[onnxruntime] transformers torch
+    python scripts/setup_model.py --model <repo-id> --out model_onnx
 """
 import argparse
 import os
