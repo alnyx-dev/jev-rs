@@ -663,12 +663,61 @@ async fn handle_systemone(
     Ok((headers, Json(resp)))
 }
 
+/// Error type that prints its message verbatim — the default `Result`
+/// reporting uses `Debug`, which would quote and escape our multi-line
+/// user-facing instructions.
+struct PlainError(String);
+
+impl std::fmt::Display for PlainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Debug for PlainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PlainError {}
+
+/// Resolve a data file path with a portable fallback chain:
+///   1. explicit env override (`JEV_MODEL_PATH` / `JEV_TOKENIZER_PATH`)
+///   2. the path relative to the current working directory
+///   3. the same path relative to the executable's directory
+/// This makes the released binary work when it is started from anywhere, as
+/// long as `model_onnx/` sits next to the executable.
+fn resolve_data_path(env_var: &str, relative: &str) -> std::path::PathBuf {
+    if let Ok(value) = std::env::var(env_var) {
+        if !value.trim().is_empty() {
+            return std::path::PathBuf::from(value);
+        }
+    }
+
+    let cwd_path = std::path::PathBuf::from(relative);
+    if cwd_path.exists() {
+        return cwd_path;
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let exe_relative = dir.join(relative);
+            if exe_relative.exists() {
+                return exe_relative;
+            }
+        }
+    }
+
+    cwd_path
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let port = std::env::var("PORT").unwrap_or_else(|_| "8000".into());
-    let model_path = std::env::var("JEV_MODEL_PATH").unwrap_or_else(|_| "model_onnx/model.onnx".into());
-    let tokenizer_path = std::env::var("JEV_TOKENIZER_PATH").unwrap_or_else(|_| "model_onnx/tokenizer.json".into());
+    let model_path = resolve_data_path("JEV_MODEL_PATH", "model_onnx/model.onnx");
+    let tokenizer_path = resolve_data_path("JEV_TOKENIZER_PATH", "model_onnx/tokenizer.json");
     let temperature = {
         let t = std::env::var("JEV_TEMPERATURE")
             .ok()
@@ -703,20 +752,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("============================================================");
     println!(" ⚡ Jev-RS: High-Performance System One Decision Engine");
     println!("============================================================");
-    println!("[*] Tokenizer path:  {}", tokenizer_path);
-    println!("[*] Model ONNX path: {}", model_path);
+    println!("[*] Tokenizer path:  {}", tokenizer_path.display());
+    println!("[*] Model ONNX path: {}", model_path.display());
     println!("[*] Calibration T:   {}", temperature);
     println!("[*] Limits: body <= {} B, concurrency = {}, timeout = {} s",
         max_body, max_concurrency, inference_timeout);
 
-    let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
-        .unwrap_or_else(|_| panic!("Failed to load tokenizer from '{}'. Run 'python scripts/setup_model.py' first!", tokenizer_path));
+    let mut tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+        PlainError(format!(
+            "Failed to load tokenizer from '{}': {}\n\n\
+             Fix it with one of:\n\
+             \x20 * place the 'model_onnx' folder next to the executable (or in the working directory)\n\
+             \x20 * set JEV_TOKENIZER_PATH / JEV_MODEL_PATH to the full paths\n\
+             \x20 * export the model first: python scripts/setup_model.py",
+            tokenizer_path.display(),
+            e
+        ))
+    })?;
     tokenizer.with_padding(Some(tokenizers::PaddingParams::default()));
 
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     println!("[*] Initializing ONNX session (Threads: {}, DirectML GPU enabled)...", threads);
 
     let environment = ort::init().build()?;
+
+    let model_load_error = |e: ort::Error| -> Box<dyn std::error::Error> {
+        PlainError(format!(
+            "Failed to load the ONNX model from '{}': {}\n\n\
+             Fix it with one of:\n\
+             \x20 * place the 'model_onnx' folder next to the executable (or in the working directory)\n\
+             \x20 * set JEV_MODEL_PATH / JEV_TOKENIZER_PATH to the full paths\n\
+             \x20 * export the model first: python scripts/setup_model.py",
+            model_path.display(),
+            e
+        ))
+        .into()
+    };
 
     #[cfg(feature = "dml")]
     let session = {
@@ -726,7 +797,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
             .with_intra_threads(threads)?
             .commit_from_file(&model_path)
-            .unwrap_or_else(|_| panic!("Failed to load model from '{}'. Run 'python scripts/setup_model.py' first!", model_path))
+            .map_err(model_load_error)?
     };
     #[cfg(not(feature = "dml"))]
     let session = {
@@ -735,7 +806,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)?
             .with_intra_threads(threads)?
             .commit_from_file(&model_path)
-            .unwrap_or_else(|_| panic!("Failed to load model from '{}'. Run 'python scripts/setup_model.py' first!", model_path))
+            .map_err(model_load_error)?
     };
 
     // Resolve the logits output name from the model signature instead of
@@ -753,7 +824,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             return Err(format!(
                 "Model output 'logits' not found (outputs: {:?}); model '{}' is not a valid NLI classification export. Re-run 'python scripts/setup_model.py'.",
-                names, model_path
+                names,
+                model_path.display()
             )
             .into());
         }
@@ -762,7 +834,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Resolve the entailment class index from the model's config.json (H4):
     // hardcoded guesses silently break NLI ordering for other exports.
-    let entailment_idx = resolve_entailment_index(&model_path);
+    let entailment_idx = resolve_entailment_index(&model_path.to_string_lossy());
 
     // Warm-up inference: validate output shape & entailment indexing before
     // serving any traffic, so a bad ONNX export fails fast with a clear error.

@@ -72,10 +72,31 @@ Open **http://127.0.0.1:8000/** — a built-in telemetry page with real-time req
 
 ## 📦 Releases
 
-Versioned binaries are published automatically: bumping `version` in
-`Cargo.toml` and pushing to `main` creates a `v*` tag and a GitHub Release
-with prebuilt binaries for `windows-x86_64` (DirectML), `linux-x86_64`
-(CPU) and `macos-aarch64` (CPU), each with a SHA-256 checksum.
+Releases are **source-only**: bumping `version` in `Cargo.toml` and pushing to
+`main` creates a `v*` tag and a GitHub Release (with the automatic source
+archives and generated release notes). No prebuilt binaries are attached —
+build locally:
+
+```bash
+pip install optimum[onnxruntime] transformers torch
+python scripts/setup_model.py          # one-time ONNX export
+
+cargo build --release                  # Windows: DirectML GPU
+# cargo build --release --no-default-features   # Linux/macOS: CPU
+
+./target/release/jev-rs
+```
+
+### Model files
+
+The model is ~2.3 GB, so it is never shipped with a release. Export it once
+with `scripts/setup_model.py` and the server will find it automatically:
+
+| Location | Priority |
+| :--- | :--- |
+| `JEV_MODEL_PATH` / `JEV_TOKENIZER_PATH` env vars | 1 (explicit override) |
+| `model_onnx/` in the working directory | 2 |
+| `model_onnx/` next to the executable | 3 |
 
 ## ⚙️ Configuration & limits
 

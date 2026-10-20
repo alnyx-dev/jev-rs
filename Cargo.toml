@@ -1,6 +1,6 @@
 [package]
 name = "jev-rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "High-performance local System One decision engine, wire-compatible with TypeSafe AI Jev protocol."
 license = "MIT"
