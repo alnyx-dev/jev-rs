@@ -54,4 +54,3 @@ jobs:
 
             The server looks for `model_onnx/` in the working directory and next
             to the executable; override with `JEV_MODEL_PATH` / `JEV_TOKENIZER_PATH`.
-          files: []
