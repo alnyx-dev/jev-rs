@@ -56,6 +56,7 @@ jobs:
           Compress-Archive -Path "dist/stage/*" -DestinationPath "dist/${{ env.ASSET_NAME }}"
           $hash = (Get-FileHash -Algorithm SHA256 "dist/${{ env.ASSET_NAME }}").Hash.ToLower()
           "$hash  ${{ env.ASSET_NAME }}" | Set-Content -NoNewline "dist/${{ env.ASSET_NAME }}.sha256"
+          Remove-Item "dist/stage" -Recurse -Force
 
       - name: Install Inno Setup
         run: choco install innosetup -y --no-progress
@@ -66,9 +67,12 @@ jobs:
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe" }
           $version = "${{ env.RELEASE_TAG }}" -replace '^v', ''
+          # The Inno script writes straight into <repo>\dist (OutputDir=..\dist).
           & $iscc "/DAppVersion=$version" "installer\jev-rs.iss"
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup build failed" }
-          Copy-Item "dist\jev-rs-setup-*.exe" dist/
+          $setup = Get-ChildItem "dist\jev-rs-setup-*.exe" | Select-Object -First 1
+          if (-not $setup) { throw "Installer binary was not produced" }
+          "Installer: $($setup.Name) ($([math]::Round($setup.Length / 1MB, 2)) MB)"
           Get-ChildItem dist | Select-Object Name, Length
 
       - uses: actions/upload-artifact@v4
