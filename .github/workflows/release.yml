@@ -1,8 +1,11 @@
 name: Release
 
-# Publishes a GitHub Release for a version tag. Source-only: GitHub attaches
-# the automatic source archives (zip/tar.gz) to the release, and users build
-# locally with `cargo build --release`.
+# Publishes a GitHub Release for a version tag.
+#
+# Assets:
+#   * jev-rs-windows-x86_64.zip  — prebuilt Windows binary (DirectML) + docs,
+#     used by the download installer (install.bat)
+#   * source archives (zip/tar.gz) — attached by GitHub automatically
 #
 # The tag can be pushed manually (`git tag v0.x.y && git push`) or created
 # automatically by autotag.yml when the Cargo.toml version changes on main.
@@ -14,43 +17,98 @@ on:
   workflow_call:
     inputs:
       tag:
-        description: "Version tag to release (e.g. v0.2.1)"
+        description: "Version tag to release (e.g. v0.3.0)"
         type: string
         required: true
 
 permissions:
   contents: write
 
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  ASSET_NAME: jev-rs-windows-x86_64.zip
+
 jobs:
+  build:
+    name: build (windows-x86_64 DirectML)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows
+
+      - name: Build (--release, locked)
+        run: cargo build --release --locked
+        env:
+          CXXFLAGS: /MD
+          CFLAGS: /MD
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/stage | Out-Null
+          Copy-Item "target/release/jev-rs.exe" dist/stage/
+          Copy-Item README.md, LICENSE, scripts/setup_model.py dist/stage/
+          Compress-Archive -Path "dist/stage/*" -DestinationPath "dist/${{ env.ASSET_NAME }}"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/${{ env.ASSET_NAME }}").Hash.ToLower()
+          "$hash  ${{ env.ASSET_NAME }}" | Set-Content -NoNewline "dist/${{ env.ASSET_NAME }}.sha256"
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build GUI installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe" }
+          $version = "${{ env.RELEASE_TAG }}" -replace '^v', ''
+          & $iscc "/DAppVersion=$version" "installer\jev-rs.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup build failed" }
+          Copy-Item "dist\jev-rs-setup-*.exe" dist/
+          Get-ChildItem dist | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          retention-days: 7
+
   publish:
     name: publish release
+    needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Create GitHub Release (source archives)
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
-          name: Jev-RS ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Jev-RS ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           body: |
-            **Source-only release** — no prebuilt binaries are attached.
-            GitHub provides the source archives (`Source code (zip)` / `(tar.gz)`).
+            **Windows users:** download `jev-rs-setup-<version>.exe` — a real
+            installer with a folder picker, shortcuts and an optional one-click
+            model download (~2.3 GB). The plain `jev-rs-windows-x86_64.zip` is
+            the portable variant.
 
-            Build and run locally:
+            **Build from source:**
 
             ```bash
-            # 1. Export the model once (Python)
             pip install optimum[onnxruntime] transformers torch
-            python scripts/setup_model.py
-
-            # 2. Build (Windows: DirectML GPU by default; other platforms: CPU)
-            cargo build --release
-            # Linux/macOS CPU build:
-            # cargo build --release --no-default-features
-
-            # 3. Run
+            python scripts/setup_model.py          # one-time ONNX export
+            cargo build --release                  # Windows: DirectML GPU
+            # cargo build --release --no-default-features   # Linux/macOS: CPU
             ./target/release/jev-rs
             ```
 
             The server looks for `model_onnx/` in the working directory and next
             to the executable; override with `JEV_MODEL_PATH` / `JEV_TOKENIZER_PATH`.
+          files: dist/*

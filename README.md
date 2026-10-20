@@ -89,7 +89,17 @@ cargo build --release                  # Windows: DirectML GPU
 
 ### 🪟 Windows quick start
 
-Two batch scripts do everything for you:
+**Installer (recommended).** Download `jev-rs-setup-<version>.exe` from the
+latest release and run it. The wizard lets you pick the installation folder
+(English / Russian), creates Start-menu and desktop shortcuts, checks that the
+Microsoft Visual C++ runtime is present, and offers to download the decision
+model (~2.3 GB) right after the installation. The uninstaller can optionally
+remove the downloaded model.
+
+**Portable variant.** `jev-rs-windows-x86_64.zip` contains the engine without
+an installer.
+
+**From source.** Two batch scripts do everything for you:
 
 | Script | What it does |
 | :--- | :--- |
@@ -104,6 +114,10 @@ run.bat            :: start the engine (Ctrl+C to stop)
 Skip parts of the installation with `JEV_SKIP_PIP=1`, `JEV_SKIP_MODEL=1` or
 `JEV_SKIP_RUST=1`. `run.bat` honours `PORT`, `HOST`, `JEV_MODEL_PATH`,
 `JEV_TOKENIZER_PATH`, `JEV_TEMPERATURE` and the other `JEV_*` settings.
+
+> The model is not shipped in releases: it is the exported
+> `MoritzLaurer/bge-m3-zeroshot-v2.0` ONNX checkpoint, downloaded from
+> Hugging Face by the installer (`installer/download-model.ps1`, resumable).
 
 ### Model files
 

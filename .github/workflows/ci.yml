@@ -33,3 +33,32 @@ jobs:
 
       - name: Compile check (--release, locked)
         run: cargo check --release --locked ${{ matrix.features }}
+
+  installer:
+    name: windows installer (Inno Setup)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build engine (release, locked)
+        run: cargo build --release --locked
+        env:
+          CXXFLAGS: /MD
+          CFLAGS: /MD
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Compile installer script
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "${env:ProgramFiles}\Inno Setup 6\ISCC.exe" }
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          & $iscc "/DAppVersion=$version" "installer\jev-rs.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup build failed" }
+          Get-ChildItem dist | Select-Object Name, Length
