@@ -7,7 +7,10 @@
 
 use axum::{
     extract::State,
-    response::{sse::{Event, KeepAlive, Sse}, Html},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html,
+    },
     Json,
 };
 use serde::Serialize;
@@ -32,10 +35,13 @@ pub struct LogEntry {
     pub questions: u32,
     /// premise-hypothesis pairs sent in the forward pass
     pub pairs: usize,
+    /// Unique prompt size: the premise once plus every hypothesis.
     pub tokens: u64,
+    /// Tokens actually fed to the model (premise repeated per pair).
+    pub batch_tokens: u64,
     pub state_preview: String,
     pub answers: serde_json::Value,
-    // rolling totals after this request (for dashboard tiles)
+    /// rolling totals after this request (for dashboard tiles)
     pub total_requests: u64,
     pub total_tokens: u64,
     pub avg_latency_ms: f64,
@@ -56,12 +62,14 @@ pub async fn dashboard() -> Html<&'static str> {
 }
 
 pub async fn history(State(app): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    let entries = app.history
+    let entries = app
+        .history
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     Json(serde_json::json!({
         "server_start_ms": app.start_ts,
+        "telemetry_enabled": app.telemetry,
         "entries": entries,
     }))
 }
@@ -72,12 +80,12 @@ pub async fn sse(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>> + Send + 'static> {
     let rx = app.tx.subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|item| match item {
-        Ok(e) => Some(Ok(Event::default().event("req").data(
-            serde_json::to_string(&e).unwrap_or_else(|_| "{}".to_string()),
-        ))),
-        Err(BroadcastStreamRecvError::Lagged(n)) => Some(Ok(
-            Event::default().event("lagged").data(n.to_string()),
-        )),
+        Ok(e) => Some(Ok(Event::default()
+            .event("req")
+            .data(serde_json::to_string(&e).unwrap_or_else(|_| "{}".to_string())))),
+        Err(BroadcastStreamRecvError::Lagged(n)) => {
+            Some(Ok(Event::default().event("lagged").data(n.to_string())))
+        }
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }

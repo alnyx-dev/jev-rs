@@ -75,9 +75,10 @@ and an explicit confidence value.
 - **Hardware accelerated** — DirectML (DirectX 12) on Windows, CPU everywhere
   else, behind a cargo feature.
 - **Self-contained telemetry** — a live dashboard with an SSE request feed,
-  latency chart and rolling statistics.
-- **Hardened** — input validation, request limits, timeouts, graceful
-  shutdown, deterministic JSON, and a unit-tested core.
+  latency chart and rolling statistics. Disable it with `JEV_TELEMETRY=0` when
+  request states must not be retained.
+- **Hardened** — input validation, request limits, timeouts, optional API key,
+  graceful shutdown, deterministic JSON, and a unit-tested core.
 
 ---
 
@@ -191,7 +192,7 @@ curl -X POST "http://127.0.0.1:8000/v1/systemone" \
     "category": {
       "type": "choice",
       "choice": "billing",
-      "probabilities": { "billing": 0.8282, "tech_bug": 0.1148, "general": 0.0570 },
+      "probabilities": { "billing": 0.8282, "tech_bug": 0.1148, "general": 0.057 },
       "confidence": 0.4831
     },
     "frustration": {
@@ -205,6 +206,11 @@ curl -X POST "http://127.0.0.1:8000/v1/systemone" \
 }
 ```
 
+`model` always reports the engine's own identity (`local-jev-rust`); a
+`model` field in the request is accepted for wire compatibility but never
+echoed back. `usage.input_tokens` is the size of the unique prompt — the
+premise once plus every hypothesis — not the padded batch.
+
 Response headers carry `x-typesafe-request-id` and `x-response-time-ms`.
 
 ### Question types
@@ -216,13 +222,16 @@ Response headers carry `x-typesafe-request-id` and `x-response-time-ms`.
 | `score` | `instructions` + `criteria` (array of strings, ordered) | expected value `1..N`, full distribution, confidence |
 
 `criteria` is mandatory for `choice` and `score`; malformed criteria are
-rejected with `400` instead of being silently coerced.
+rejected with `400` instead of being silently coerced. Duplicate criteria are
+rejected as well — a duplicate would collapse in the probability map while the
+winner is still chosen over the full list, which silently produced
+distributions that did not sum to 1.
 
 ### Routes
 
 | Route | Purpose |
 | :--- | :--- |
-| `POST /v1/systemone` | inference |
+| `POST /v1/systemone` | inference (requires the API key when `JEV_API_KEY` is set) |
 | `GET /` | live dashboard |
 | `GET /dashboard` | live dashboard (alias) |
 | `GET /events` | Server-Sent Events, one `req` event per inference |
@@ -239,10 +248,14 @@ Every error is a JSON envelope:
 
 | Code | Meaning |
 | :--- | :--- |
-| `400` | malformed request (unknown type, missing / empty / non-string `criteria`) |
+| `400` | malformed request (unknown type, missing / empty / non-string / duplicate `criteria`, unparsable body, missing field), empty `state`, `state` longer than `JEV_MAX_STATE_CHARS`, encoded sequence or batch over the token budget |
+| `401` | missing or invalid API key (`JEV_API_KEY` is set) |
 | `413` | request body over `JEV_MAX_BODY_BYTES` |
-| `503` | too many concurrent inferences (`JEV_MAX_CONCURRENCY`) |
-| `504` | inference timed out (`JEV_TIMEOUT`) |
+| `503` | no free inference slot (`JEV_MAX_CONCURRENCY`) |
+| `504` | inference timed out (`JEV_TIMEOUT`), including the wait for a free slot |
+
+Every malformed request answers `400` — a missing field, a missing content
+type or an unparsable body all use the same envelope and the same status.
 
 ---
 
@@ -255,11 +268,20 @@ Everything is environment-based; all defaults work out of the box.
 | `HOST` | `127.0.0.1` | Bind address. A non-loopback host prints a security warning (`JEV_ALLOW_REMOTE=1` acknowledges it). |
 | `PORT` | `8000` | Listen port. |
 | `JEV_MODEL_PATH` | `model_onnx/model.onnx` | ONNX model file. |
-| `JEV_TOKENIZER_PATH` | `model_onnx/tokenizer.json` | Tokenizer file. |
+| `JEV_TOKENIZER_PATH` | next to the model | Tokenizer file. When unset, `tokenizer.json` is looked up next to the model, so a model and its tokenizer can never come from different exports by accident. |
 | `JEV_TEMPERATURE` | `1.65` | RLCD calibration temperature; must be finite and `0 < t ≤ 10`, otherwise the server refuses to start. |
 | `JEV_MAX_BODY_BYTES` | `131072` | Request-body limit (`413`). |
-| `JEV_MAX_CONCURRENCY` | `2` | Concurrent forward passes (`503`). |
-| `JEV_TIMEOUT` | `30` | Per-request inference timeout in seconds (`504`). |
+| `JEV_MAX_CONCURRENCY` | `2` | Inference slots (`503` when exhausted). Forward passes themselves are serialized by the session lock. |
+| `JEV_TIMEOUT` | `30` | Per-request inference timeout in seconds (`504`). Covers queue time for the inference slot as well as the forward pass. |
+| `JEV_MAX_STATE_CHARS` | `2000` | Maximum number of characters in `state` (`400`). Keeps a premise inside the latency budget. |
+| `JEV_MAX_SEQ_TOKENS` | `2048` | Maximum tokens per encoded pair (`400`). Capped by the model's position limit. |
+| `JEV_MAX_BATCH_TOKENS` | `8192` | Maximum padded tokens per forward pass, i.e. `pairs × seq_len` (`400`). |
+| `JEV_API_KEY` | *(unset)* | When set, the inference endpoint requires `X-API-Key: <key>` or `Authorization: Bearer <key>` (`401`). |
+| `JEV_TELEMETRY` | `1` | Set to `0` to retain and broadcast nothing: no request states are stored, the history stays empty and the dashboard shows no feed. Counters (requests, latency, tokens) are kept. |
+
+> ℹ️ The input limits are enforced **before** the forward pass, so an oversized
+> request is a clean `400` instead of an ONNX Runtime failure. Raise them with
+> care: the cost of the pass grows with `pairs × seq_len`.
 
 ---
 
@@ -273,7 +295,12 @@ Open **http://127.0.0.1:8000/** — a built-in telemetry page with:
 - automatic backfill of the last 50 requests from `/history`.
 
 The feed is driven by Server-Sent Events; slow clients receive a `lagged`
-notice instead of stalling the engine.
+notice instead of stalling the engine. Requests delivered by both the event
+stream and the backfill are de-duplicated by their request id.
+
+Set `JEV_TELEMETRY=0` to switch the retention off completely: no request
+state is stored or broadcast, the history stays empty and the dashboard shows
+no feed. Only the anonymous counters (requests, latency, tokens) remain.
 
 ---
 
@@ -304,6 +331,8 @@ jev-rs/
 │   ├── test_request.ps1 # smoke test (PowerShell)
 │   └── test_request.sh  # smoke test (bash)
 ├── .cargo/config.toml   # MSVC linker flags, macOS availability symbols
+├── .github/workflows/   # ci.yml (fmt, clippy, tests) + release.yml
+├── rust-toolchain.toml  # pinned toolchain channel
 ├── install.bat          # Windows one-time setup
 ├── run.bat              # Windows launcher
 └── Cargo.toml
@@ -314,14 +343,21 @@ jev-rs/
 ## 🛠️ Development
 
 ```bash
-cargo test --release          # 19 unit tests: validation, calibration, entropy
+cargo test --release          # 44 unit tests: validation, calibration, entropy
 cargo build --release         # Windows / DirectML
 cargo build --release --no-default-features   # CPU-only build
+cargo fmt --all              # formatting (enforced in CI)
+cargo clippy --all-targets --all-features
 ```
 
 The core is covered by unit tests: question flattening and its rejection
-cases, softmax calibration values, confidence bounds and entailment-index
-resolution from the model config.
+cases (including duplicate criteria), softmax calibration values, confidence
+bounds, entailment-index resolution from the model config (including negated
+labels such as `not_entailment`), input-limit enforcement, API-key comparison
+and error-message sanitization.
+
+`jev-rs --help` lists the flags; everything else is configured through the
+environment variables above.
 
 ---
 

@@ -54,7 +54,10 @@ if not defined JEV_SKIP_PIP (
 
 REM --- 2. Model --------------------------------------------------------------
 if not defined JEV_SKIP_MODEL (
-    if exist "model_onnx\model.onnx" (
+    REM The export is split: model.onnx holds the graph, model.onnx_data holds
+    REM the ~2.3 GB of external weights. A partial download must not be taken
+    REM for a finished export.
+    if exist "model_onnx\model.onnx" if exist "model_onnx\model.onnx_data" (
         echo [3/4] Model already exported: model_onnx\model.onnx
     ) else (
         echo [3/4] Exporting the ONNX model ^(one-time ~2.3 GB download^) ...

@@ -1,0 +1,53 @@
+name: CI
+
+# Verifies every push and pull request on Windows:
+#   * formatting
+#   * lints
+#   * unit tests (both the DirectML and the CPU-only build)
+#
+# The release workflow only builds a binary — it never runs the tests, so a
+# broken core would otherwise reach a release unnoticed.
+#
+# Windows-only by design: the published artifact is the DirectML build and
+# the ONNX Runtime prebuilt binaries are resolved for this target.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  # The ONNX Runtime prebuilt binaries are built against the release CRT.
+  CXXFLAGS: /MD
+  CFLAGS: /MD
+
+jobs:
+  check:
+    name: check (windows / DirectML)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-windows
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Unit tests (DirectML)
+        run: cargo test --release --locked
+
+      - name: Unit tests (CPU-only)
+        run: cargo test --release --locked --no-default-features
+
+      - name: Build (--release, locked)
+        run: cargo build --release --locked

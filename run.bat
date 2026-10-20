@@ -11,8 +11,13 @@ REM    JEV_MODEL_PATH=...        full path to model.onnx
 REM    JEV_TOKENIZER_PATH=...    full path to tokenizer.json
 REM    JEV_TEMPERATURE=1.65      calibration temperature
 REM    JEV_MAX_BODY_BYTES=131072 request body limit
-REM    JEV_MAX_CONCURRENCY=2     concurrent inference limit
+REM    JEV_MAX_CONCURRENCY=2     inference slots
 REM    JEV_TIMEOUT=30            per-request inference timeout, seconds
+REM    JEV_MAX_STATE_CHARS=2000  maximum length of the "state" field
+REM    JEV_MAX_SEQ_TOKENS=2048   maximum tokens per encoded pair
+REM    JEV_MAX_BATCH_TOKENS=8192 maximum padded tokens per forward pass
+REM    JEV_API_KEY=...         require this key on the inference endpoint
+REM    JEV_TELEMETRY=0         do not retain or broadcast request states
 REM
 REM  Any argument is passed through to the server, e.g.:  run.bat --help
 REM ============================================================================

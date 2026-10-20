@@ -322,6 +322,9 @@
   const MAX = 40;
   const MAX_FEED = 50;
   const latencies = [];
+  // Request ids already rendered — the SSE stream and the /history backfill
+  // can deliver the same request twice.
+  const seen = new Set();
   let serverStart = 0;
 
   const el = id => document.getElementById(id);
@@ -420,6 +423,18 @@
   }
 
   function addEntry(e, prepend) {
+    if (e.id && seen.has(e.id)) return;
+    if (e.id) seen.add(e.id);
+    if (seen.size > 500) {
+      // Keep the set bounded; the oldest ids are gone from the feed anyway.
+      const it = seen.values();
+      for (let i = 0; i < 200; i++) {
+        const v = it.next();
+        if (v.done) break;
+        seen.delete(v.value);
+      }
+    }
+
     const emptyEl = feed.querySelector('.empty');
     if (emptyEl) emptyEl.remove();
 
@@ -445,7 +460,7 @@
 
     const extraEl = document.createElement('span');
     extraEl.className = 'extra';
-    extraEl.textContent = '· ' + e.questions + ' Qs · ' + fmtCount(e.tokens) + ' toks';
+    extraEl.textContent = '· ' + e.questions + ' Qs · ' + e.pairs + ' pairs · ' + fmtCount(e.tokens) + ' toks';
 
     const msEl = document.createElement('span');
     msEl.className = 'ms ' + getLatencyClass(e.latency_ms);
@@ -486,15 +501,22 @@
   fetch('/history').then(r => r.json()).then(j => {
     serverStart = j.server_start_ms;
     const entries = j.entries || [];
-    
-    // Гарантируем стабильный порядок:
+
+    if (j.telemetry_enabled === false) {
+      const s = el('status');
+      s.className = 'badge off';
+      s.innerHTML = '<span class="dot"></span><span>telemetry disabled</span>';
+      feed.innerHTML = '<div class="empty">Telemetry is disabled on this server ' +
+        '(JEV_TELEMETRY=0) — request states are neither stored nor broadcast.</div>';
+      return;
+    }
+
+    // Stable order: newest first in the feed, chronological in the chart.
     const chronological = [...entries].sort((a, b) => a.ts - b.ts);
     const newestFirst = [...chronological].reverse();
 
-    // В ленту добавляем самые свежие наверх
     newestFirst.forEach(e => addEntry(e, false));
 
-    // В график добавляем хронологически слева направо
     chronological.forEach(e => {
       latencies.push(e.latency_ms);
       if (latencies.length > MAX) latencies.shift();
@@ -513,8 +535,18 @@
     s.className = 'badge off';
     s.innerHTML = '<span class="dot"></span><span>reconnecting…</span>';
   });
+  es.addEventListener('lagged', ev => {
+    // The subscriber fell behind the broadcast buffer: some requests were
+    // dropped. The /history backfill can recover them.
+    const s = el('status');
+    s.className = 'badge off';
+    s.innerHTML = '<span class="dot"></span><span>lagged — reload for missed requests</span>';
+  });
   es.addEventListener('req', ev => {
     const e = JSON.parse(ev.data);
+    // A request already delivered by the /history backfill must not be
+    // counted twice.
+    if (e.id && seen.has(e.id)) return;
     pushBar(e.latency_ms);
     setTiles(e);
     addEntry(e, true);
